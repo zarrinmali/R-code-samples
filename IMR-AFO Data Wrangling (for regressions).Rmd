@@ -1,0 +1,1104 @@
+---
+title: "IMR-AFO Data Wrangling"
+author: "Zarrin Ali"
+date: "2024-07-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+pacman::p_load(
+  here, foreign, tidyverse, raster, sf, httr2,
+  tigris # Load Census TIGER/Line shapefiles
+)
+select <- dplyr::select
+options(readr.show_col_types = F) # suppress read_csv info
+options(dplyr.summarise.inform = F) # suppress summarize info
+options(tigris_use_cache = T) # cache the data to avoid re-downloading in future R sessions
+```
+
+This code was written by me when I was working as an RA for Professor Eyal Frank at Harris School of Public Policy at UChicago.
+
+This script processes Animal Feeding Operations (AFO) and infant mortality rate (IMR) data for five U.S. states (NC, MI, WI, IA, MN) to create spatially and temporally harmonized datasets for regression analysis. It performs the following:
+  1. Cleans and consolidates facility-level AFO data, converting start and end dates into a monthly panel of AFO activity from roughly 1989–2018 (year range varies by state).
+  2. Spatially links AFOs to counties using shapefiles and constructs county-by-year-by-month counts of active AFOs.
+  3. Computes AFO counts within distance gradations (0–100 km) around both population-weighted and geographic centroids for each county and time period.
+  4. Generates separate state-level and combined datasets for both centroid types so that the resulting datasets contain the number of AFOs by distance gradation around the population and geographic-weighted centroids at the county-by-year-by-month level for each of the states mentioned.
+  5. Cleans and aggregates two types of IMR data (from detailed mortality files and linked birth–death records), merges with county-level populations, and calculates monthly IMR values.
+
+
+# Animal Feeding Operations (AFO) data
+
+## Cleaning AFO data and converting to long form
+
+### Define function to get panel data
+
+```{r}
+##-------------------------------------------------------------------------/
+#' Convert set of {start & end dates} into long panel of 1{active} for each time step
+#' assumes that end_date==NA means end_date==infinity
+startEndDates_to_longPanel <- function (ids, startDate_ids, endDate_ids, resolution="year", startDate_panel=NA_Date_, endDate_panel=NA_Date_) {
+  
+  # set panel's sequence of dates
+  if (is.na(startDate_panel)) {date_min = min(startDate_ids, na.rm=T)} else {date_min = startDate_panel}
+  if (is.na(endDate_panel)) {date_max = max(endDate_ids, na.rm=T)} else {date_max = endDate_panel}
+  date_min <- date_min %>% lubridate::round_date(unit = resolution)
+  date_max <- date_max %>% lubridate::round_date(unit = resolution)
+  dates_panel.df <- data.frame(paneldate = seq.Date(date_min, date_max, by = resolution)) %>%
+    mutate(paneldate_index = row_number())
+
+  # convert ids' {start & end dates} to the panel's resolution
+  input.df = bind_cols(id = ids, start = startDate_ids, end = endDate_ids) %>%
+    mutate(
+      start_panelformat = start %>% as.Date() %>% lubridate::floor_date(unit = resolution),
+      end_panelformat = end %>% as.Date() %>% lubridate::floor_date(unit = resolution)
+    ) %>%
+    
+ 
+    select(-start, -end)
+  input.df$start_panelformat[is.na(input.df$start_panelformat)] = date_min
+  input.df$end_panelformat[is.na(input.df$end_panelformat)] = date_max
+  
+
+  panel = dates_panel.df %>%
+    merge(ids, by=NULL) %>%
+    rename(id = y) %>%
+    left_join(input.df, by = "id") %>%
+    mutate(active = 1*(paneldate>=start_panelformat & paneldate<=end_panelformat)) %>%
+    select(id, paneldate_roundedDate = paneldate, paneldate_index, active) %>%
+    setNames(., names(.) %>% str_replace("paneldate", resolution))
+  return(panel)
+  #cols = c("id", "<resolution>_roundedDate", "<resolution>_index", "active")
+  #rm(date_min, date_max, dates_panel.df, input.df, panel)
+}
+```
+
+### Load AFOs data
+
+```{r}
+afos_admin_raw <- read_csv("/Users/zarrinali/Documents/AFOs data/IMR-AFOs regression/AFOs_NC_admin-1997-2022.csv") ## North Carolina
+
+afos_MI <- read_csv("/Users/zarrinali/Documents/AFOs data/AFOs_MI_till2022.csv")
+
+afos_WI <- read_csv("/Users/zarrinali/Documents/AFOs data/AFOs_WI_till2024_new.csv")
+
+afos_IA <- read_csv("/Users/zarrinali/Documents/AFOs data/AFOs_IA_admin-till2024.csv")
+
+afos_MN <- read_csv("/Users/zarrinali/Documents/AFOs data/AFOs_MN_admin-2016-2023.csv")
+```
+
+### AFO start-end dataset for each state and combined
+
+```{r}
+# NC
+afos_startend <- afos_admin_raw %>%
+  group_by(facilityId, lat, lon) %>%
+  summarize(
+    # Just AFO counts (drop AU columns)
+    across(c(date_firstPermit, date_open, date_periodBegin), ~collapse::fmin(.x)),
+    date_periodEnd = collapse::fmax(date_periodEnd),
+    animalTypes = first(animalTypes)) %>%
+  filter(year(date_periodEnd) >= 1997, date_periodEnd != date_periodBegin) %>%
+  mutate(start = pmin(date_firstPermit, date_open, date_periodBegin, na.rm=T),
+         # truncate to Mar 1997 - Dec 2022
+         start = pmax(start, as.Date("1997-03-01")),
+         end = pmin(date_periodEnd, as.Date("2022-12-31"))) %>%
+  ungroup   ## Highest start date is 2022-07 
+
+
+# MI
+
+
+## There is one facility in the MI dataset for which the date_firstPermit is 1899-12-30 and the date_periodBegin is 2012-04-24. For all other facilities, the date_firstPermit is 2003-08-27 or after that. For a few facilities without date_firstPermit, the date_periodBegin is 2003-01-01. So we assume the dataset covers the whole period from 2003-01-01 until 2022.
+
+
+afos_startend_MI <- afos_MI %>%
+ group_by(facilityId, lat, lon) %>%
+  summarize(
+    # Just AFO counts (drop AU columns)
+    across(c(date_firstPermit, date_periodBegin), ~collapse::fmin(.x)),
+    date_periodEnd = collapse::fmax(date_periodEnd),
+    animalTypes = first(animalTypes)) %>% # Making sure that each facilityid corresponds to 1 row only
+  
+  filter(date_periodEnd != date_periodBegin) %>% # Min date_periodEnd is 2003-12-31
+  mutate(start = if_else(!is.na(date_firstPermit), date_firstPermit, date_periodBegin),
+         # truncate to Jan 2003 - Dec 2022
+         start = pmax(start, as.Date("2003-01-01")),
+         end = pmin(date_periodEnd, as.Date("2022-12-31"))) %>%
+  filter(year(start) <= 2022, format(start, "%Y-%m") != format(end, "%Y-%m")) %>% ## This line removes one entry for which start date was in 2023
+  ungroup 
+
+
+# WI
+
+afos_startend_WI <- afos_WI %>%
+  group_by(facilityId, lat, lon) %>%
+  summarize(
+    # Just AFO counts (drop AU columns)
+    across(c(date_isAlreadyOpenBy, date_open, date_periodBegin), ~collapse::fmin(.x)),
+    date_periodEnd = collapse::fmax(date_periodEnd),
+    animalTypes = first(animalTypes)) %>%
+  
+  filter(date_periodEnd != date_periodBegin) %>% # min date_periodEnd is in 2015
+  mutate(start = if_else(!is.na(date_open), date_open, date_periodBegin),
+         # truncate to Jul 1990 - Dec 2018 (IMR data ends here)
+         start = pmax(start, as.Date("1990-07-01")), # JUl 1990 is the min in the date_open column
+         end = pmin(date_periodEnd, as.Date("2018-12-31"))) %>%
+  filter(year(start) <= 2018, format(start, "%Y-%m") != format(end, "%Y-%m"), start <= end) %>%
+  ungroup
+
+
+# IA
+
+
+afos_startend_IA <- afos_IA %>%
+  group_by(facilityId, lat, lon) %>%
+  summarize(
+    # Just AFO counts (drop AU columns)
+    across(c(date_open, date_periodBegin), ~collapse::fmin(.x)),
+    across(c(date_periodEnd, date_close), ~collapse::fmax(.x)),
+    animalTypes = first(animalTypes)) %>%
+  
+  filter(date_periodEnd != date_periodBegin) %>% 
+  mutate(end = if_else(!is.na(date_close), date_close, date_periodEnd),
+         # truncate to Jan 1989 - Dec 2018 (Range of IMR data)
+         start = pmax(date_open, as.Date("1989-01-01")), #date_open column does not have NA for any entry
+         end = pmin(end, as.Date("2018-12-31"))) %>%
+  filter(year(start) <= 2018, format(start, "%Y-%m") != format(end, "%Y-%m"), start <= end) %>%
+  ungroup
+## date_open ranges from 1956 to 2024
+## earliest date_open is 1956-01-01 but IMR data is only available from 1989. So truncate from 1989-2018
+
+
+# MN
+afos_startend_MN <- afos_MN %>%
+  group_by(facilityId, lat, lon) %>%
+  summarize(
+    # Just AFO counts (drop AU columns)
+    across(c(date_firstRegistration, date_periodBegin), ~collapse::fmin(.x)),
+    date_periodEnd = collapse::fmax(date_periodEnd),
+    animalTypes = first(animalTypes)) %>% #Taking the min and max rowwise so each row corresponds to one facility
+  filter(date_periodEnd != date_periodBegin) %>% 
+  mutate(start = if_else(!is.na(date_firstRegistration), date_firstRegistration, date_periodBegin),
+         #Truncate to Jan 1989 - Dec 2018 which is the range of the IMR data. Start dates go back to 1973
+         start = pmax(start, as.Date("1989-01-01")), 
+         end = pmin(date_periodEnd, as.Date("2018-12-31"))) %>% 
+  filter(year(start) <= 2018, format(start, "%Y-%m") != format(end, "%Y-%m"), start <= end) %>%
+  ungroup
+
+
+# ALL STATES COMBINED
+
+afos_startend_1 <- afos_startend %>%
+  select(facilityId, lat, lon, start, end)
+afos_startend_MI_1 <- afos_startend_MI %>%
+  select(facilityId, lat, lon, start, end)
+afos_startend_WI_1 <- afos_startend_WI %>%
+  select(facilityId, lat, lon, start, end)
+afos_startend_IA_1 <- afos_startend_IA %>%
+  select(facilityId, lat, lon, start, end)
+afos_startend_MN_1 <- afos_startend_MN %>%
+  select(facilityId, lat, lon, start, end)
+
+
+afos_startend_NC_MI_WI_IA_MN <- rbind(afos_startend_1, afos_startend_MI_1, afos_startend_WI_1, afos_startend_IA_1, afos_startend_MN_1) 
+
+```
+
+### Panel dataset of AFO count across all states (combined AFO count)
+
+```{r}
+# Applying the function to get combined long form data across all states
+
+NC_MI_WI_IA_MN_long <- afos_startend_NC_MI_WI_IA_MN %>%
+  select(facilityId, start, end) %>%
+  {startEndDates_to_longPanel(ids=.$facilityId, startDate_ids=.$start, endDate_ids=.$end, resolution='month')} %>%
+  mutate(
+    year = year(month_roundedDate),
+    month = month(month_roundedDate)
+  ) %>%
+  select(-month_roundedDate, -month_index) %>%
+  left_join(afos_startend_NC_MI_WI_IA_MN %>% select(facilityId, lat, lon), by = c("id" = "facilityId")) # This dataset is not truncated for common period between these states
+```
+
+## County-by-year-by-month AFO count for all states
+
+```{r}
+# Set CRSs (Coordinate Reference System)
+myEPSG_projected = 3857
+myEPSG_unprojected = 4326
+
+# List of state FIPS codes for NC, MI, WI, IA, MN
+state_fips <- c(37, 55, 19, 26, 27)
+
+# Function to load and transform county shapefiles for the above states
+load_counties <- function(state_fip) {
+  counties <- counties(state = state_fip, cb = TRUE) %>%
+    st_transform(crs = st_crs(myEPSG_unprojected)) %>%
+    rename(fips = GEOID, county = NAME) # This will allow us to match AFO data with infant health data later
+  return(counties)
+}
+
+# Load and combine shapefiles for all specified states
+counties.sf <- bind_rows(lapply(state_fips, load_counties))
+```
+
+```{r}
+# Matching facilityid to county and aggregating the AFO data by county, year and month
+
+# Convert AFO data to spatial points
+afos_sf_combined <- afos_startend_NC_MI_WI_IA_MN %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+# Spatial join AFO data with county shapefile
+afos_with_counties_combined <- st_join(afos_sf_combined, counties.sf, join = st_within) %>%
+  select(facilityId, county, fips, STATEFP, STATE_NAME) %>%
+  rename(id = facilityId)
+
+# Note: MN012977 is not spatially joined to any county in the 5 states because it falls in South Dakota (right by the boundary of MN). Let it get dropped.
+
+
+# Each facility by year-month is mapped to county
+afos_long_yrmonth_county_combined <- NC_MI_WI_IA_MN_long %>%
+  left_join(afos_with_counties_combined, by = "id") 
+
+
+# Group by county and year & summarize the number of active AFOs in each county in each year-month 
+
+afos_by_county_yrmth_combined <- afos_long_yrmonth_county_combined %>%
+  group_by(county, fips, year, month) %>%
+  summarize(n_AFOs = sum(active)) %>%
+  ungroup()
+
+afos_by_county_yrmth_combined <- afos_by_county_yrmth_combined %>%
+  mutate(
+    STATE = substr(fips, 1, 2), 
+    COUNTY = substr(fips, 3, 5)
+  ) %>%
+  rename(NAME = county) %>%
+  filter(year <= 2018)
+
+afos_by_county_yrmth_combined$STATE <- as.integer(afos_by_county_yrmth_combined$STATE)
+```
+
+```{r}
+# Adding missing county-year-month combinations 
+
+# Generate a sequence of all years and months from Jan 2003 to December 2018
+all_years <- rep(1989:2018, each = 12)
+all_months <- rep(1:12, length(1989:2018))
+year_month <- data.frame(year = all_years, month = all_months)
+year_month <- year_month[!(year_month$year == 1989 & year_month$month < 1), ]
+
+# Get unique states and counties from data
+
+unique_counties_combined <- counties.sf %>%
+  select(STATEFP, COUNTYFP, county) %>%
+  st_drop_geometry() %>%
+  rename(COUNTY = COUNTYFP,
+         STATE = STATEFP,
+         NAME = county) %>%
+  mutate(COUNTY = as.character(COUNTY),
+         STATE = as.integer(STATE)
+         ) %>%
+  filter(STATE %in% c(37, 55, 26, 19, 27)) %>%
+  distinct()
+
+# Create a complete data frame with all combinations of county, year, and month
+complete_data_combined <- unique_counties_combined %>%
+  crossing(year_month)
+
+# Merge with the existing data
+afos_by_county_yrmth_combined <- complete_data_combined %>%
+  left_join(afos_by_county_yrmth_combined, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in the 'n_AFOs' column with 0
+afos_by_county_yrmth_combined <- afos_by_county_yrmth_combined %>%
+  mutate(n_AFOs = replace_na(n_AFOs, 0))
+
+# Fix the fips column with NA values
+afos_by_county_yrmth_combined <- afos_by_county_yrmth_combined %>%
+  mutate(fips = paste0(STATE, COUNTY))
+
+# Saving file 
+write.csv(afos_by_county_yrmth_combined, file = "/Users/zarrinali/AFOs data/All AFOs by county-yr-mth 1989-2018", row.names = FALSE)
+```
+
+## AFOs by distance gradation around population-weighted centroids
+
+### Population-weighted centroids for all counties for all years and months
+
+```{r}
+all_centroids = data.frame(
+  STATE = character(),
+  COUNTY = character(),
+  id = character(),
+  lat = double(),
+  lon = double(),
+  year = integer(),
+  population = integer()
+)
+
+data_years = c(1990, 2000, 2010, 2020)
+
+for (year in data_years) {
+  expand_years = c((year - 4):(year + 5))
+  centroid_data = read.csv(paste0('/Users/zarrinali/Documents/AFOs data/', year, ' county weighted coords.csv'))
+  for (expanding_year in expand_years) {
+    for (month in 1:12) {
+      all_centroids = centroid_data %>%
+        mutate(year = expanding_year, month = month) %>%
+        rbind(all_centroids)
+    }
+  }
+}
+
+# Have population-weighted centroids for each Census year. Then allocted them to all the observations within the -4/+5 years window around that census year with year by month resolution
+# Now you should have a dataset with all the county centroids for every year and month
+```
+
+### Function computes the distance between two sets of coordinates
+
+```{r}
+#returns the distance between the two points IN KM
+haversine <- function(lat1, lon1, lat2, lon2) {
+  # Convert latitude and longitude from degrees to radians
+  lat1 <- lat1 * pi / 180
+  lon1 <- lon1 * pi / 180
+  lat2 <- lat2 * pi / 180
+  lon2 <- lon2 * pi / 180
+  
+  # Haversine formula
+  dlat <- lat2 - lat1
+  dlon <- lon2 - lon1
+  a <- sin(dlat / 2)^2 + cos(lat1) * cos(lat2) * sin(dlon / 2)^2
+  c <- 2 * asin(sqrt(a))
+  
+  # Radius of earth in kilometers (mean radius)
+  r <- 6371.0
+  
+  # Calculate the result
+  d <- r * c
+  return(d)
+}
+```
+
+```{r}
+# Preparing combined long form dataset
+
+NC_MI_WI_IA_MN_long_filtered = NC_MI_WI_IA_MN_long %>%
+  filter(active == 1) %>%
+  distinct(id, year, month, .keep_all = TRUE)
+
+NC_MI_WI_IA_MN_long_filtered = NC_MI_WI_IA_MN_long_filtered %>%
+  select(id, lat, lon, year, month) %>%
+  rename(afo_id = id, afo_lat = lat, afo_lon = lon)
+
+```
+
+```{r}
+# Select state and start and end year 
+
+myStates = c(37, 26, 55, 19, 27)
+start_year = 1989
+end_year = 2018
+
+# Create a sequence of year and month combinations
+myMonths = expand.grid(year = start_year:end_year, month = 1:12)
+myMonths = myMonths %>%
+  filter(!(year == 1989 & month < 1)) # Start from Jan 1989
+
+```
+
+```{r}
+# Load and prepare centroids dataset for relevant states and start-end year
+
+all_centroids_filtered = all_centroids %>%
+  filter(!(year == 1989 & month < 1),
+         year >= start_year,
+         year <= end_year,
+         STATE %in% myStates) # Filter to only keep records from Jan 1989 - Dec 2018
+
+all_centroids_filtered = all_centroids_filtered %>%
+  rename(county_lat = weighted_lat, 
+         county_lon = weighted_lon
+         )
+```
+
+### Creating the AFOs by distance bins by county-year-month dataset around population-weighted county centroids
+
+```{r}
+# Applying the formula and further manipulations to get AFOs by distance bins
+
+combined_county_years_months = data.frame(
+  COUNTY = character(),
+  year = integer(),
+  month = integer(),
+  count_under_5 = integer(),
+  count_5_to_10 = integer(),
+  count_10_to_15 = integer(),
+  count_15_to_20 = integer(),
+  count_20_to_25 = integer(),
+  count_25_to_30 = integer(),
+  count_30_to_40 = integer(),
+  count_40_to_100 = integer()
+)
+
+for (i in 1:nrow(myMonths)) {
+  current_year <- myMonths$year[i]
+  current_month <- myMonths$month[i]
+  
+  afos = NC_MI_WI_IA_MN_long_filtered %>% # Using long form dataset with all AFOs across all states
+    filter(year == current_year, month == current_month)
+  centroids_all = all_centroids_filtered %>%
+    filter(year == current_year, month == current_month)
+  combinations_all <- merge(afos, centroids_all, by = NULL) %>%
+    mutate(distance = haversine(afo_lat, afo_lon, county_lat, county_lon)) %>%
+    filter(distance <= 100)
+  binned_counties_all <- combinations_all %>%
+    group_by(STATE, COUNTY) %>%
+    summarise(
+      count_under_5 = sum(distance <= 5),
+      count_5_to_10 = sum(distance > 5 & distance <= 10),
+      count_10_to_15 = sum(distance > 10 & distance <= 15),
+      count_15_to_20 = sum(distance > 15 & distance <= 20),
+      count_20_to_25 = sum(distance > 20 & distance <= 25),
+      count_25_to_30 = sum(distance > 25 & distance <= 30),
+      count_30_to_40 = sum(distance > 30 & distance <= 40),
+      count_40_to_100 = sum(distance > 40 & distance <= 100)
+    )
+  binned_counties_all = mutate(binned_counties_all, year = current_year, month = current_month)
+  combined_county_years_months = rbind(combined_county_years_months, binned_counties_all)
+}
+
+```
+
+```{r}
+# Adding county names and creating fips column
+
+county_lookup <- counties.sf %>% 
+  select(STATEFP, COUNTYFP, county) %>% # Select relevant columns
+  st_drop_geometry() %>%
+  rename(COUNTY = COUNTYFP,
+         STATE = STATEFP,
+         NAME = county) %>%
+  mutate(COUNTY = as.integer(COUNTY),
+         STATE = as.integer(STATE)
+         ) %>%
+  filter(STATE %in% myStates)
+
+combined_county_years_months = left_join(combined_county_years_months, county_lookup, by = c("STATE", "COUNTY")) %>%
+  mutate(COUNTY = sprintf("%03d", as.numeric(COUNTY)),
+         fips = paste0(STATE, COUNTY)) 
+```
+
+### State-by-state datasets
+
+#### NC
+
+```{r}
+NC_pop_dist_grad <- combined_county_years_months %>%
+  filter(STATE == 37) # Has AFO by dist grad data from Mar 1997 - Dec 2018
+
+# Adding missing county-year-month combinations 
+
+# Generate a sequence of all years and months from March 1997 to December 2018
+all_years <- rep(1997:2018, each = 12)
+all_months <- rep(1:12, length(1997:2018))
+year_month <- data.frame(year = all_years, month = all_months)
+year_month <- year_month[!(year_month$year == 1997 & year_month$month < 3), ]
+
+# Get unique states and counties from data
+unique_counties_NC <- NC_pop_dist_grad %>%
+  select(STATE, COUNTY, NAME) %>%
+  distinct()
+
+# Create a complete data frame with all combinations of county, year, and month
+complete_data_NC <- unique_counties_NC %>%
+  crossing(year_month)
+
+# Merge with the existing data
+NC_pop_dist_grad <- complete_data_NC %>%
+  left_join(NC_pop_dist_grad, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in AFO count columns with zeros
+afo_columns <- grep("^count_", names(NC_pop_dist_grad), value = TRUE)
+NC_pop_dist_grad[afo_columns][is.na(NC_pop_dist_grad[afo_columns])] <- 0
+
+# Fix the fips column with NA values
+NC_pop_dist_grad <- NC_pop_dist_grad %>%
+  mutate(fips = paste0(STATE, COUNTY))
+
+```
+
+#### MI
+
+```{r}
+MI_pop_dist_grad <- combined_county_years_months %>%
+  filter(STATE == 26, year >= 2003) # The combined dataset has AFO info for MI from 2000 but MI AFO dataset starts from 2003
+
+
+# Adding missing county-year-month combinations 
+
+# Generate a sequence of all years and months from Jan 2003 to December 2018
+all_years <- rep(2003:2018, each = 12)
+all_months <- rep(1:12, length(2003:2018))
+year_month <- data.frame(year = all_years, month = all_months)
+year_month <- year_month[!(year_month$year == 2003 & year_month$month < 1), ]
+
+# Get unique states and counties from the data
+
+unique_counties_MI <- counties.sf %>%
+  select(STATEFP, COUNTYFP, county) %>%
+  st_drop_geometry() %>%
+  rename(COUNTY = COUNTYFP,
+         STATE = STATEFP,
+         NAME = county) %>%
+  mutate(COUNTY = as.character(COUNTY),
+         STATE = as.integer(STATE)
+         ) %>%
+  filter(STATE == 26) %>%
+  distinct()
+
+# Create a complete data frame with all combinations of county, year, and month
+complete_data_MI <- unique_counties_MI %>%
+  crossing(year_month)
+
+# Merge with the existing data
+MI_pop_dist_grad <- complete_data_MI %>%
+  left_join(MI_pop_dist_grad, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in AFO count columns with zeros
+afo_columns <- grep("^count_", names(MI_pop_dist_grad), value = TRUE)
+MI_pop_dist_grad[afo_columns][is.na(MI_pop_dist_grad[afo_columns])] <- 0
+
+# Fix the fips column with NA values
+MI_pop_dist_grad <- MI_pop_dist_grad %>%
+  mutate(fips = paste0(STATE, COUNTY))
+```
+
+#### WI
+
+```{r}
+WI_pop_dist_grad <- combined_county_years_months %>%
+  filter(
+    STATE == 55, 
+    year > 1990 | (year == 1990 & month >= 7)
+  ) #combined dataset has AFO data for WI starting from 1989 but WI AFO data starts from Jul 1990
+
+# Adding missing county-year-month combinations 
+
+# Generate a sequence of all years and months from July 1990 to December 2018
+all_years <- rep(1990:2018, each = 12)
+all_months <- rep(1:12, length(1990:2018))
+year_month <- data.frame(year = all_years, month = all_months)
+year_month <- year_month[!(year_month$year == 1990 & year_month$month < 7), ]
+
+# Get unique states and counties from data
+
+unique_counties_WI <- counties.sf %>%
+  select(STATEFP, COUNTYFP, county) %>%
+  st_drop_geometry() %>%
+  rename(COUNTY = COUNTYFP,
+         STATE = STATEFP,
+         NAME = county) %>%
+  mutate(COUNTY = as.character(COUNTY),
+         STATE = as.integer(STATE)
+         ) %>%
+  filter(STATE == 55) %>%
+  distinct()
+
+# Create a complete data frame with all combinations of county, year, and month
+complete_data_WI <- unique_counties_WI %>%
+  crossing(year_month)
+
+# Merge with the existing data
+WI_pop_dist_grad <- complete_data_WI %>%
+  left_join(WI_pop_dist_grad, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in AFO count columns with zeros
+afo_columns <- grep("^count_", names(WI_pop_dist_grad), value = TRUE)
+WI_pop_dist_grad[afo_columns][is.na(WI_pop_dist_grad[afo_columns])] <- 0
+
+# Fix the fips column with NA values
+WI_pop_dist_grad <- WI_pop_dist_grad %>%
+  mutate(fips = paste0(STATE, COUNTY))
+```
+
+#### IA
+
+```{r}
+IA_pop_dist_grad <- combined_county_years_months %>%
+  filter(STATE == 19) # AFO data from Jan 1989 - Dec 2018
+
+# Adding missing county-year-month combinations 
+
+# Generate a sequence of all years and months from Jan 1989 to December 2018
+all_years <- rep(1989:2018, each = 12)
+all_months <- rep(1:12, length(1989:2018))
+year_month <- data.frame(year = all_years, month = all_months)
+year_month <- year_month[!(year_month$year == 1989 & year_month$month < 1), ]
+
+# Get unique states and counties from the data
+
+unique_counties_IA <- counties.sf %>%
+  select(STATEFP, COUNTYFP, county) %>%
+  st_drop_geometry() %>%
+  rename(COUNTY = COUNTYFP,
+         STATE = STATEFP,
+         NAME = county) %>%
+  mutate(COUNTY = as.character(COUNTY),
+         STATE = as.integer(STATE)
+         ) %>%
+  filter(STATE == 19) %>%
+  distinct()
+
+# Create a complete data frame with all combinations of county, year, and month
+complete_data_IA <- unique_counties_IA %>%
+  crossing(year_month)
+
+# Merge with the existing data
+IA_pop_dist_grad <- complete_data_IA %>%
+  left_join(IA_pop_dist_grad, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in AFO count columns with zeros
+afo_columns <- grep("^count_", names(IA_pop_dist_grad), value = TRUE)
+IA_pop_dist_grad[afo_columns][is.na(IA_pop_dist_grad[afo_columns])] <- 0
+
+# Fix the fips column with NA values
+IA_pop_dist_grad <- IA_pop_dist_grad %>%
+  mutate(fips = paste0(STATE, COUNTY))
+```
+
+#### MN
+
+```{r}
+MN_pop_dist_grad <- combined_county_years_months %>%
+  filter(STATE == 27) # AFO data from Jan 1989 - Dec 2018
+
+# Adding missing county-year-month combinations 
+
+# Generate a sequence of all years and months from Jan 1989 to December 2018
+all_years <- rep(1989:2018, each = 12)
+all_months <- rep(1:12, length(1989:2018))
+year_month <- data.frame(year = all_years, month = all_months)
+year_month <- year_month[!(year_month$year == 1989 & year_month$month < 1), ]
+
+# Get unique states and counties from data
+
+unique_counties_MN <- counties.sf %>%
+  select(STATEFP, COUNTYFP, county) %>%
+  st_drop_geometry() %>%
+  rename(COUNTY = COUNTYFP,
+         STATE = STATEFP,
+         NAME = county) %>%
+  mutate(COUNTY = as.character(COUNTY),
+         STATE = as.integer(STATE)
+         ) %>%
+  filter(STATE == 27) %>%
+  distinct()
+
+# Create a complete data frame with all combinations of county, year, and month
+complete_data_MN <- unique_counties_MN %>%
+  crossing(year_month)
+
+# Merge with the existing data
+MN_pop_dist_grad <- complete_data_MN %>%
+  left_join(MN_pop_dist_grad, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in AFO count columns with zeros
+afo_columns <- grep("^count_", names(MN_pop_dist_grad), value = TRUE)
+MN_pop_dist_grad[afo_columns][is.na(MN_pop_dist_grad[afo_columns])] <- 0
+
+# Fix the fips column with NA values
+MN_pop_dist_grad <- MN_pop_dist_grad %>%
+  mutate(fips = paste0(STATE, COUNTY))
+```
+
+#### Combined (truncated)
+
+```{r}
+combined_pop_dist_grad <- combined_county_years_months %>%
+  filter(year >= 2003) 
+
+# Adding missing county-year-month combinations 
+
+# Merge with the existing data
+combined_pop_dist_grad <- complete_data_combined %>%
+  left_join(combined_pop_dist_grad, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in AFO count columns with zeros
+afo_columns <- grep("^count_", names(combined_pop_dist_grad), value = TRUE)
+combined_pop_dist_grad[afo_columns][is.na(combined_pop_dist_grad[afo_columns])] <- 0
+
+# Fix the fips column with NA values
+combined_pop_dist_grad <- combined_pop_dist_grad %>%
+  mutate(fips = paste0(STATE, COUNTY))
+```
+
+```{r}
+# Save all the files 
+
+write.csv(NC_pop_dist_grad, file = "/Users/zarrinali/Documents/AFOs data/NC AFO distance gradation by pop centroids", row.names = FALSE)
+write.csv(MI_pop_dist_grad, file = "/Users/zarrinali/Documents/AFOs data/MI AFO distance gradation by pop centroids", row.names = FALSE)
+write.csv(WI_pop_dist_grad, file = "/Users/zarrinali/Documents/AFOs data/WI AFO distance gradation by pop centroids", row.names = FALSE)
+write.csv(IA_pop_dist_grad, file = "/Users/zarrinali/Documents/AFOs data/IA AFO distance gradation by pop centroids", row.names = FALSE)
+write.csv(MN_pop_dist_grad, file = "/Users/zarrinali/Documents/AFOs data/MN AFO distance gradation by pop centroids", row.names = FALSE)
+write.csv(combined_pop_dist_grad, file = "/Users/zarrinali/Documents/AFOs data/ALL AFO distance gradation by pop centroids", row.names = FALSE)
+
+```
+
+## AFOs by distance gradation around geographic-weighted centroids
+
+### Geographic centroids for all counties for all years and months
+
+```{r}
+all_geo_centroids = data.frame(
+  STATE = character(),
+  COUNTY = character(),
+  id = character(),
+  lat = double(),
+  lon = double(),
+  year = integer(),
+  population = integer()
+)
+
+data_years = c(1990, 2000, 2010, 2020)
+
+for (year in data_years) {
+  expand_years = c((year - 4):(year + 5))
+  centroid_data = read.csv(paste0('/Users/zarrinali/Documents/AFOs data/', year, ' geo centroids.csv'))
+  for (expanding_year in expand_years) {
+    for (month in 1:12) {
+      all_geo_centroids = centroid_data %>%
+        mutate(year = expanding_year, month = month) %>%
+        rbind(all_geo_centroids)
+    }
+  }
+}
+
+
+# Have geographic centroids for each Census year. Then allocted them to all the observations within the -4/+5 years window around that census year with year by month resolution
+# Now we have a dataset with centroids for every year and month.
+```
+
+```{r}
+# Select state and start and end year 
+
+myStates = c(37, 26, 55, 19, 27)
+start_year = 1989
+end_year = 2018
+
+# Create a sequence of year and month combinations
+myMonths = expand.grid(year = start_year:end_year, month = 1:12)
+myMonths = myMonths %>%
+  filter(!(year == 1989 & month < 1)) # Start from Jan 1989
+
+
+```
+
+```{r}
+# Prepare centroids dataset (AFO dataset already loaded)
+
+
+all_geo_centroids_filtered = all_geo_centroids %>%
+  filter(!(year == 1989 & month < 1),
+         year >= start_year,
+         year <= end_year,
+         STATEFP %in% myStates) # Filter to only keep records from Jan 1989 - Dec 2018
+
+all_geo_centroids_filtered = all_geo_centroids_filtered %>%
+  rename(county_lat = latitude, 
+         county_lon = longitude
+         )
+
+```
+
+### Creating the AFOs by distance bins by county-year-month dataset around geographic county centroids
+
+```{r}
+# Applying the formula and further manipulations to get AFOs by distance bins around geo centroids
+
+combined_county_years_months_geo = data.frame(
+  COUNTY = character(),
+  year = integer(),
+  month = integer(),
+  count_under_5 = integer(),
+  count_5_to_10 = integer(),
+  count_10_to_15 = integer(),
+  count_15_to_20 = integer(),
+  count_20_to_25 = integer(),
+  count_25_to_30 = integer(),
+  count_30_to_40 = integer(),
+  count_40_to_100 = integer()
+)
+
+for (i in 1:nrow(myMonths)) {
+  current_year <- myMonths$year[i]
+  current_month <- myMonths$month[i]
+  
+  afos_geo = NC_MI_WI_IA_MN_long_filtered %>% 
+    filter(year == current_year, month == current_month)
+  centroids_geo_all = all_geo_centroids_filtered %>%
+    filter(year == current_year, month == current_month)
+  combinations_geo_all <- merge(afos_geo, centroids_geo_all, by = NULL) %>%
+    mutate(distance = haversine(afo_lat, afo_lon, county_lat, county_lon)) %>%
+    filter(distance <= 100)
+  binned_counties_geo_all <- combinations_geo_all %>%
+    group_by(STATEFP, COUNTYFP) %>%
+    summarise(
+      count_under_5 = sum(distance <= 5),
+      count_5_to_10 = sum(distance > 5 & distance <= 10),
+      count_10_to_15 = sum(distance > 10 & distance <= 15),
+      count_15_to_20 = sum(distance > 15 & distance <= 20),
+      count_20_to_25 = sum(distance > 20 & distance <= 25),
+      count_25_to_30 = sum(distance > 25 & distance <= 30),
+      count_30_to_40 = sum(distance > 30 & distance <= 40),
+      count_40_to_100 = sum(distance > 40 & distance <= 100)
+    )
+  binned_counties_geo_all = mutate(binned_counties_geo_all, year = current_year, month = current_month)
+  combined_county_years_months_geo = rbind(combined_county_years_months_geo, binned_counties_geo_all)
+}
+
+combined_county_years_months_geo <- combined_county_years_months_geo %>%
+  rename(COUNTY = COUNTYFP,
+         STATE = STATEFP)
+
+# Now you have a dataset with the AFOs by distance bins around the geographic centroid of all counties across the 5 states from Jan 1989 - December 2018
+
+```
+
+```{r}
+# Adding county names and creating fips column
+
+combined_county_years_months_geo = left_join(combined_county_years_months_geo, county_lookup, by = c("STATE", "COUNTY")) %>%
+  mutate(COUNTY = sprintf("%03d", as.numeric(COUNTY)),
+         fips = paste0(STATE, COUNTY)) 
+```
+
+### State-by-state datasets
+
+#### NC
+
+```{r}
+NC_geo_dist_grad <- combined_county_years_months_geo %>%
+  filter(STATE == 37) # Has AFO by dist grad data from Mar 1997 - Dec 2018
+
+# Adding missing county-year-month combinations 
+
+# Merge with the existing data
+NC_geo_dist_grad <- complete_data_NC %>% #complete_data datasets were created before
+  left_join(NC_geo_dist_grad, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in AFO count columns with zeros
+afo_columns <- grep("^count_", names(NC_geo_dist_grad), value = TRUE)
+NC_geo_dist_grad[afo_columns][is.na(NC_geo_dist_grad[afo_columns])] <- 0
+
+# Fix the fips column with NA values
+NC_geo_dist_grad <- NC_geo_dist_grad %>%
+  mutate(fips = paste0(STATE, COUNTY))
+```
+
+#### MI
+
+```{r}
+MI_geo_dist_grad <- combined_county_years_months_geo %>%
+  filter(STATE == 26, year >= 2003) # The combined dataset has AFO info for MI from 2000 but MI AFO dataset starts from 2003
+
+# Adding missing county-year-month combinations 
+
+# Merge with the existing data
+MI_geo_dist_grad <- complete_data_MI %>%
+  left_join(MI_geo_dist_grad, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in AFO count columns with zeros
+afo_columns <- grep("^count_", names(MI_geo_dist_grad), value = TRUE)
+MI_geo_dist_grad[afo_columns][is.na(MI_geo_dist_grad[afo_columns])] <- 0
+
+# Fix the fips column with NA values
+MI_geo_dist_grad <- MI_geo_dist_grad %>%
+  mutate(fips = paste0(STATE, COUNTY))
+
+```
+
+#### WI
+
+```{r}
+WI_geo_dist_grad <- combined_county_years_months_geo %>%
+  filter(
+    STATE == 55, 
+    year > 1990 | (year == 1990 & month >= 7)
+  ) #combined dataset has AFO data for WI starting from 1989 but WI AFO data starts from Jul 1990
+
+
+# Merge with the existing data
+WI_geo_dist_grad <- complete_data_WI %>%
+  left_join(WI_geo_dist_grad, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in AFO count columns with zeros
+afo_columns <- grep("^count_", names(WI_geo_dist_grad), value = TRUE)
+WI_geo_dist_grad[afo_columns][is.na(WI_geo_dist_grad[afo_columns])] <- 0
+
+# Fix the fips column with NA values
+WI_geo_dist_grad <- WI_geo_dist_grad %>%
+  mutate(fips = paste0(STATE, COUNTY))
+
+```
+
+#### IA
+
+```{r}
+IA_geo_dist_grad <- combined_county_years_months_geo %>%
+  filter(STATE == 19) # AFO data from Jan 1989 - Dec 2018
+
+# Adding missing county-year-month combinations 
+
+# Merge with the existing data
+IA_geo_dist_grad <- complete_data_IA %>%
+  left_join(IA_geo_dist_grad, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in AFO count columns with zeros
+afo_columns <- grep("^count_", names(IA_geo_dist_grad), value = TRUE)
+IA_geo_dist_grad[afo_columns][is.na(IA_geo_dist_grad[afo_columns])] <- 0
+
+# Fix the fips column with NA values
+IA_geo_dist_grad <- IA_geo_dist_grad %>%
+  mutate(fips = paste0(STATE, COUNTY))
+
+```
+
+#### MN
+
+```{r}
+MN_geo_dist_grad <- combined_county_years_months_geo %>%
+  filter(STATE == 27) # AFO data from Jan 1989 - Dec 2018
+
+# Adding missing county-year-month combinations 
+
+
+# Merge with the existing data
+MN_geo_dist_grad <- complete_data_MN %>%
+  left_join(MN_geo_dist_grad, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in AFO count columns with zeros
+afo_columns <- grep("^count_", names(MN_geo_dist_grad), value = TRUE)
+MN_geo_dist_grad[afo_columns][is.na(MN_geo_dist_grad[afo_columns])] <- 0
+
+# Fix the fips column with NA values
+MN_geo_dist_grad <- MN_geo_dist_grad %>%
+  mutate(fips = paste0(STATE, COUNTY))
+
+```
+
+#### Combined (truncated)
+
+```{r}
+combined_geo_dist_grad <- combined_county_years_months_geo %>%
+  filter(year >= 2003) 
+
+# Adding missing county-year-month combinations 
+
+# Merge with the existing data
+combined_geo_dist_grad <- complete_data_combined %>%
+  left_join(combined_geo_dist_grad, by = c("STATE", "COUNTY", "NAME", "year", "month")) 
+
+# Replace NA values in AFO count columns with zeros
+afo_columns <- grep("^count_", names(combined_geo_dist_grad), value = TRUE)
+combined_geo_dist_grad[afo_columns][is.na(combined_geo_dist_grad[afo_columns])] <- 0
+
+# Fix the fips column with NA values
+combined_geo_dist_grad <- combined_geo_dist_grad %>%
+  mutate(fips = paste0(STATE, COUNTY))
+
+```
+
+```{r}
+# Save 
+
+write.csv(NC_geo_dist_grad, file = "/Users/zarrinali/Documents/AFOs data/NC AFO distance gradation by geo centroids", row.names = FALSE)
+write.csv(MI_geo_dist_grad, file = "/Users/zarrinali/Documents/AFOs data/MI AFO distance gradation by geo centroids", row.names = FALSE)
+write.csv(WI_geo_dist_grad, file = "/Users/zarrinali/Documents/AFOs data/WI AFO distance gradation by geo centroids", row.names = FALSE)
+write.csv(IA_geo_dist_grad, file = "/Users/zarrinali/Documents/AFOs data/IA AFO distance gradation by geo centroids", row.names = FALSE)
+write.csv(MN_geo_dist_grad, file = "/Users/zarrinali/Documents/AFOs data/MN AFO distance gradation by geo centroids", row.names = FALSE)
+write.csv(combined_geo_dist_grad, file = "/Users/zarrinali/Documents/AFOs data/ALL AFO distance gradation by geo centroids", row.names = FALSE)
+
+```
+
+# IMR data
+
+```{r}
+# Load the datasets
+
+imr_monthly_1989_2018 <- read_dta("/Users/zarrinali/Documents/AFOs data/imr_monthly_1989_2018.dta")
+
+monthly_aggregated_death_certificates <- read_dta("/Users/zarrinali/Documents/AFOs data/monthly_aggregated_death_certificates.dta") %>%
+  rename(fips = fipscode) #Renaming column for consistency across datasets
+
+monthly_aggregated_birth_certificates <- read_dta("/Users/zarrinali/Documents/AFOs data/monthly_aggregated_birth_certificates.dta") %>%
+  rename(fips = fipscode)
+
+pop_data <- read_csv("/Users/zarrinali/Documents/AFOs data/pop_19692020_bycounty-year-agegroup-race.csv") %>%
+  filter(year >= 1989 & year <= 2018) %>%
+  select(year, stateFIPS, countyFIPS, pop) %>%
+  mutate(fips = paste0(stateFIPS, countyFIPS))
+  
+```
+
+```{r}
+# Aggregating the population by each unique year-fips combination
+
+total_pop_data <- pop_data %>%
+  select(year, pop, fips) %>%
+  group_by(year, fips) %>%
+  summarize(total_pop = sum(pop), .groups = 'drop') 
+```
+
+## Calculate IMR from detailed mortality files
+
+```{r}
+# Function to expand population dataset by month
+
+expand_by_month <- function(df) {
+  df %>%
+    # Create a sequence of months for each row
+    group_by(fips, year) %>%
+    tidyr::expand(month = 1:12) %>%
+    ungroup() %>%
+    # Join back with the original data to get population values
+    left_join(df, by = c("fips", "year")) %>%
+    # Arrange data by county, year, and month
+    arrange(fips, year, month)
+}
+
+# Applying the function to get year by month population data for each county
+total_pop_data <- expand_by_month(total_pop_data)
+
+# Calculating IMR
+imr_dmf <- merge(total_pop_data, imr_monthly_1989_2018, by = c("fips", "year", "month"), all.x = TRUE) %>%
+  select(fips, year, month, total_pop, dmf_inf_deaths) %>%
+  mutate(IMR = (dmf_inf_deaths / total_pop) * 100000)
+
+imr_dmf <- imr_dmf %>%
+  mutate(STATE = substr(fips, 1, 2)) %>%
+  filter(STATE %in% c("37", "55", "26", "19", "27")) #There are no NA values in the IMR column
+
+# Save dmf IMR data for future use
+write.csv(imr_dmf, file = "/Users/zarrinali/Documents/AFOs data/Detailed mortality IMR.csv", row.names = FALSE)
+```
+
+## Calculate IMR from linked birth-death
+
+```{r}
+imr_lbd <- merge(monthly_aggregated_birth_certificates, monthly_aggregated_death_certificates, by = c("fips", "year", "month"), all.x = TRUE) %>% 
+  select(fips, year, month, lbd_inf_births, lbd_inf_deaths) %>%
+  mutate(IMR = (lbd_inf_deaths / lbd_inf_births) * 1000)
+
+#all.x = TRUE ensures that the extra rows in birth certificate file are also included. None of the extra entries correspond to counties in our 5 states
+
+imr_lbd <- imr_lbd %>%
+  mutate(STATE = substr(fips, 1, 2)) %>%
+  filter(STATE %in% c("37", "55", "26", "19", "27")) #IMR column has NA for some rows for which infant birth and death are both 0 so nothing to worry about
+
+# Save lbd IMR data for future use
+write.csv(imr_lbd, file = "/Users/zarrinali/Documents/AFOs data/Linked birth-death IMR.csv", row.names = FALSE)
+
+```
