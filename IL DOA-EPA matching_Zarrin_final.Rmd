@@ -1,0 +1,1327 @@
+---
+title: "IL DOA-EPA matching"
+author: "Zarrin Ali"
+output: pdf_document
+date: "2024-08-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(
+  here, tidyverse, rlist,
+  measurements #to convert coordinates from 'deg min sec' to decimal degrees
+)
+select <- dplyr::select
+options(readr.show_col_types = FALSE) # suppress read_csv info
+options(dplyr.summarise.inform = FALSE) # suppress summarize info
+library(readxl)
+```
+
+This code was written by me when I was working as an RA for Professor Eyal Frank at Harris School of Public Policy in UChicago.
+
+This script cleans, deduplicates, and merges Animal Feeding Operation (AFO) records in Illinois from two state agencies, the Department of Agriculture (DOA) and the Environmental Protection Agency (EPA), to create a unified, geocoded facility-level dataset.
+
+Main steps: 1.
+DOA internal matching: - Splits the raw DOA dataset into records with and without facility IDs.
+- Uses fuzzy string matching on facility names to identify potential duplicates.
+- Filters matches by county and animal type, applies a similarity threshold, and reviews results manually in Excel as needed.
+- Creates a cleaned, unique facility-level dataset with consolidated coordinates and ownership information.
+2.
+DOA–EPA cross-agency matching: - Fuzzy-joins DOA and EPA datasets by facility name, filters by same county, and groups matches by string similarity.
+- Calculates geographic distances between matched facility coordinates to confirm validity.
+- Conducts manual verification in Excel for ambiguous cases.
+- Merges confirmed matches and appends unmatched DOA and EPA facilities to preserve full coverage.
+3.
+Final dataset - Collapses the merged dataset so that each facility corresponds to one row, consolidating similar facility and owner names using string distance metrics.
+- Ensures each unique facility has one consistent ID, name, address, and set of coordinates.
+
+# Within DOA matching
+
+```{r}
+# Load dataset
+raw_IL_DOA_2 <- read_csv("/Users/zarrinali/Documents/AFOs_IL/dataRAW_Zarrin/raw_IL-DOA-2.csv")
+
+file_path <- "/Users/zarrinali/Documents/AFOs_IL/dataINTERM_Zarrin/Within-DOA matching"
+```
+
+```{r}
+# Split into those to match (have no id) and those to be matched (have an id)
+DOA_no_id <- raw_IL_DOA_2 %>%
+  filter(is.na(id_operation_DOA)) %>%
+  select(name_owner, name_facility, animalTypes, address, county, lat_plss, lon_plss, lat_raw, lon_raw, AUs)
+
+DOA_with_id <- raw_IL_DOA_2 %>%
+  filter(!is.na(id_operation_DOA)) %>%
+  select(id_operation_DOA, name_owner, name_facility, animalTypes, address, county, lat_plss, lon_plss, lat_raw, lon_raw, AUs)
+
+# Fuzzy-join by string distance of name_facility
+matches_raw <- fuzzyjoin::stringdist_join(
+  x = DOA_no_id,
+  y = DOA_with_id,
+  by = "name_facility",
+  method = 'cosine',
+  max_dist = 10,
+  mode = 'left', # left join includes all rows from DOA_no_id and matched rows from DOA_with_id
+  ignore_case = T,
+  distance_col = "distance" # store the string distances
+)
+
+matches_raw <- matches_raw %>%
+  select(name_facility.x, name_facility.y, distance, name_owner.x, name_owner.y, address.x, address.y, id_operation_DOA, county.x, county.y, animalTypes.x, animalTypes.y, everything())
+
+# Filter: drop very bad matches and keep 5 best matches -> drop matches for which county and animal type dont match then keep 5 best matches
+matches_filtered <- matches_raw %>%
+  filter(county.x==county.y) %>% # Filter out matches that are not in the same county
+  filter(animalTypes.x==animalTypes.y) %>%
+  select(-county.y, -animalTypes.y) %>%
+  rename(county = county.x, animalTypes = animalTypes.x) %>%
+  group_by(name_facility.x) %>%
+  arrange(distance) %>%
+  filter(row_number()<=5) %>%
+  select(name_facility.x, name_facility.y, distance, name_owner.x, name_owner.y, address.x, address.y, id_operation_DOA, everything())
+
+# Simplifying dataset for determining threshold
+matches_filtered_1 <- matches_filtered %>% 
+  filter(distance != 0)
+  
+# Determining the threshold: determine in such a way that for all facilities under that threshold the smallest dist is the best match.
+
+# Group 1: High quality matches
+matched_gp1 <- matches_filtered %>%
+  filter(distance < 0.1) %>% # The threshold chosen is 0.1
+  group_by(name_facility.x) %>%
+  filter(distance==min(distance)) %>% ungroup 
+
+# Group 2: Remaining matches 
+matched_gp2 <- matches_filtered %>%
+  anti_join(matched_gp1 %>% select(name_facility.x), by = "name_facility.x") %>% # Excludes facility names already in the first group
+  arrange(name_facility.x, distance) # Groups same faciliy names together and arranges by distance
+
+# Saving datasets to view in Excel
+write.csv(matched_gp1, file.path(file_path, "matched_gp1.csv"), row.names = FALSE)
+write.csv(matched_gp2, file.path(file_path, "matched_gp2.csv"), row.names = FALSE)
+write.csv(matches_raw, file.path(file_path, "matches_raw.csv"), row.names = FALSE)
+
+# Process so far: divided the doa dataset into two: {those to match (have no id); those to be matched with (have an id)} and then did a fuzzymatch using name_facility. After skimming through the dataset and some deliberation (to make sure the following makes sense), filtered out the matches that have different counties and different animal types and kept the 5 best matches for each facility. Then took a threshold of 0.1 such that for all facilities under that threshold the smallest dist is the best match. Grouped the matches into two: (1) for dist < 0.1, the match with the smallest dist was kept, (2) for all other facility names, the top 5 matches with smallest dist are kept. Both datasets will be eventually collapsed to facility-by-name-by-name-owner level (so each facility will correspond to multiple rows if facility name/name owner are different).
+
+# Reviewed matched_gp2 in Excel to keep the best match. For some facilities, the 5 matches with the smallest dist do not contain the best name match so searched for the best match in matches_raw (removed matches with diff county and animal type to streamline the search in matches_raw).
+
+# Next steps: The data is divided into many groups and each group is individually reviewed and collapsed to the facility-by-name-by-name-owner level. Each following code chunk corresponds to one such group
+```
+
+## Group 1, part 1: Matches for which name_facility.x = name_facility.y (i.e., dist = 0)
+
+```{r}
+# Reminder: columns with .x suffix corresponds to the entries with no id_operation_DOA and columns with .y corresponds to entries with id_operation_DOA 
+
+# Filtering to keep records for which name_facility.x = name_facility.y
+matched_gp1_filtered <- matched_gp1 %>%  
+  filter(distance == 0) # Only 10/1840 rows in matched_gp1 have dist > 0 so will deal with them separately
+
+# Gather the .x and .y columns into long format where 1 row corresponds to the .x columns and the next row corresponds to the .y column
+long_gp1 <- matched_gp1_filtered %>% 
+  pivot_longer(
+    cols = ends_with(c(".x", ".y")),
+    names_to = c(".value", "source"),
+    names_pattern = "(.*)\\.(x|y)"
+  )
+
+# Remove duplicate rows
+long_gp1_filt <- long_gp1 %>%
+  select(name_facility, name_owner, id_operation_DOA, county, animalTypes, address , lat_plss, lon_plss, lat_raw, lon_raw) %>%
+  distinct() 
+
+# Create the unique facility-level identifier by unique name_facility (Obviously, the same name_facility may refer to multiple facilities and multiple name_facilities may actually refer to 1 facility, so this column is subject to many changes as I sort through the data in Excel)
+collapsed_gp1 <- long_gp1_filt %>% 
+  group_by(name_facility) %>%
+  mutate(my_Id_facility_doa = paste0("ildoa_", cur_group_id())) %>%
+  ungroup() %>%
+  arrange(name_facility, my_Id_facility_doa) %>%
+  select(name_facility, name_owner, my_Id_facility_doa, everything()) 
+
+# Saving the dataset for review in Excel
+write.csv(collapsed_gp1, file.path(file_path, "collapsed_gp1.csv"), row.names = FALSE)
+
+# Next steps: After reviewing collapsed_gp1 the 1st time (saved as collapsed_gp1_edited), will review some specific cases and then update the existing dataset
+
+# 1st edited version from Excel
+collapsed_gp1_edited<- read_csv(file.path(file_path, "collapsed_gp1_edited.csv"))
+
+# Case 1: reviewing entries for which name_facility is different but id_operation_DOA is same
+test_1 <- collapsed_gp1_edited %>%
+  group_by(id_operation_DOA) %>%
+  filter(n_distinct(name_facility) > 1) %>%
+  ungroup() %>%
+  arrange(id_operation_DOA)
+write.csv(test_1, file.path(file_path, "diff_name_same_id_doa.csv"), row.names = FALSE)
+
+
+# 2nd edited version from Excel after integrating case 1
+collapsed_gp1_edited_2 <- read_csv(file.path(file_path, "collapsed_gp1_edited_2.csv"))
+
+# Case 2: reviewing entries for which unique identifier (my_Id_facility_doa) is different but id_operation_DOA
+test_2 <- collapsed_gp1_edited_2 %>%
+  group_by(id_operation_DOA) %>%
+  filter(n_distinct(my_Id_facility_doa) > 1) %>%
+  ungroup() %>%
+  arrange(id_operation_DOA)
+write.csv(test_2, file.path(file_path, "diff_uniqueid_same_id_doa.csv"), row.names = FALSE)
+
+# 3rd edited version from Excel after integrating case 2
+collapsed_gp1_edited_3 <- read_csv(file.path(file_path, "collapsed_gp1_edited_3.csv"))
+
+# Case 3: reviewing entries with same unique identifier (my_Id_facility_doa) but diff id_operation_DOA
+test_3 <- collapsed_gp1_edited_3 %>%
+  group_by(my_Id_facility_doa) %>%
+  filter(n_distinct(id_operation_DOA) > 1) %>%
+  ungroup() %>%
+  arrange(my_Id_facility_doa)
+write.csv(test_3, file.path(file_path, "diff_id_doa_same_uniqueid.csv"), row.names = FALSE)
+        
+# Final edited version from Excel after integrating case 1, 2 and 3
+collapsed_gp1_edited_4 <- read_csv(file.path(file_path, "collapsed_gp1_edited_4.csv"))
+```
+
+## Group 1, part 2: Matches for which 0 \< dist \< 0.1 (i.e., entries in matched_gp1 with dist \> 0)
+
+```{r}
+matched_gp1_filtered_2 <- matched_gp1 %>%  
+  filter(distance != 0) # Only 10 such entries
+
+#Gather the .x and .y columns into long format
+long_gp1_pt2 <- matched_gp1_filtered_2 %>% 
+  pivot_longer(
+    cols = ends_with(c(".x", ".y")),
+    names_to = c(".value", "source"),
+    names_pattern = "(.*)\\.(x|y)"
+  ) %>% select(name_facility, name_owner, id_operation_DOA, county, animalTypes, address , lat_plss, lon_plss, lat_raw, lon_raw)
+
+# Create the unique facility-level identifier (fixed later in Excel)
+collapsed_gp1_pt2 <- long_gp1_pt2 %>% 
+  group_by(name_facility) %>%
+  mutate(my_Id_facility_doa = paste0("ildoa_", cur_group_id())) %>%
+  ungroup() %>%
+  arrange(name_facility, my_Id_facility_doa) %>%
+  select(name_facility, name_owner, my_Id_facility_doa, everything()) 
+
+# Saving the dataset for review in Excel
+write.csv(collapsed_gp1_pt2, file.path(file_path, "collapsed_gp1_pt2.csv"), row.names = FALSE)
+
+# Final edited version from Excel
+collapsed_gp1_pt2_edited <- read_csv(file.path(file_path, "collapsed_gp1_pt2_edited.csv"))
+```
+
+## Group 2: Low quality matches (i.e., entries in matched_gp2)
+
+```{r}
+# Reviewed matched_gp2 in Excel and saved as matched_gp2_pt1_edited (had confusion about some facilities so sent them to Claire for matching)
+matched_gp2_pt1_edited <- read_csv(file.path(file_path, "matched_gp2_pt1_edited.csv"))
+matched_gp2_pt1_edited <- matched_gp2_pt1_edited %>%
+  filter(rowSums(is.na(.)) != ncol(.)) # Remove rows with NA in all columns
+
+#G ather the .x and .y columns into long format
+long_gp2_pt1 <- matched_gp2_pt1_edited %>% 
+  pivot_longer(
+    cols = ends_with(c(".x", ".y")),
+    names_to = c(".value", "source"),
+    names_pattern = "(.*)\\.(x|y)"
+  ) %>% select(name_facility, name_owner, id_operation_DOA, county, animalTypes, address , lat_plss, lon_plss, lat_raw, lon_raw) %>% distinct()
+  
+# Create the unique facility-level identifier (fixed later in Excel)
+collapsed_gp2_pt1 <- long_gp2_pt1 %>% 
+  group_by(name_facility) %>%
+  mutate(my_Id_facility_doa = paste0("ildoa_", cur_group_id())) %>%
+  ungroup() %>%
+  arrange(id_operation_DOA) %>%
+  select(name_facility, name_owner, my_Id_facility_doa, everything()) 
+
+# Saving the dataset for review in Excel
+write.csv(collapsed_gp2_pt1, file.path(file_path, "collapsed_gp2_pt1.csv"), row.names = FALSE)
+
+# Final edited version from Excel (including the facilities that Claire matched)
+collapsed_gp2_edited <- read_csv(file.path(file_path, "collapsed_gp2_edited.csv"))
+
+```
+
+```{r}
+# Combined doa dataset from groups 1 and 2
+doa_final_gp1_gp2 <- rbind(collapsed_gp1_edited_4, collapsed_gp1_pt2_edited, collapsed_gp2_edited)
+write.csv(doa_final_gp1_gp2, file.path(file_path, "doa_final_gp1_gp2.csv"), row.names = FALSE)
+
+```
+
+## Group 4: Remaining facilities, i.e., facilities (based on name_facility) not in doa_final_gp1_gp2 but in raw_IL_DOA_2
+
+```{r}
+# Filter rows where name_facility in raw_IL_DOA_2 is not in doa_final_gp1_gp2 (and save for review in Excel)
+gp_4 <- raw_IL_DOA_2 %>% 
+  filter(!name_facility %in% doa_final_gp1_gp2$name_facility) %>% 
+  select(name_facility, name_owner, id_operation_DOA, county, animalTypes, address , lat_plss, lon_plss, lat_raw, lon_raw)
+write.csv(gp_4, file.path(file_path, "gp_4"), row.names = FALSE)
+
+# Case A: filter those from gp_4 for which id_operation_DOA is in gp_4 AND doa_final_gp1_gp2 
+gp_4_a <- gp_4 %>%
+  filter(id_operation_DOA %in% doa_final_gp1_gp2$id_operation_DOA) # Filter rows where id_operation_DOA is in both gp_4 and doa_final_gp1_gp2
+
+# Case B: also filter those entries in gp_4 where id_operation_DOA is NA
+gp_4_na_id_doa <- gp_4 %>%
+  filter(is.na(id_operation_DOA)) 
+
+# Combine Case A and B and save for review in Excel
+gp_4_filtered <- bind_rows(gp_4_a, gp_4_na_id_doa) %>% 
+  arrange(name_facility)
+write.csv(gp_4_filtered, file.path(file_path, "gp_4_filtered.csv"), row.names = FALSE)
+
+# Sorted through gp_4_filtered on Excel and added entries to doa_final_gp1_gp2_gp4
+
+# Case C: entries that are in gp_4 but not gp_4_filtered (and save for review in Excel)
+gp_4_rest <- anti_join(gp_4, gp_4_filtered) %>%
+  arrange(id_operation_DOA) %>% distinct()
+write.csv(gp_4_rest, file.path(file_path, "gp_4_rest.csv"), row.names = FALSE)
+
+# Final edited version from Excel with cases A, B and C integrated
+doa_final_gp1_gp2_gp4 <- read_csv(file.path(file_path, "doa_final_gp1_gp2_gp4.csv"))
+```
+
+## Group 5: Facilities for where name_facility is NA
+
+```{r}
+# Approach: This group is divided into several parts for easier data wrangling
+
+DOA_no_name_facility <- raw_IL_DOA_2 %>%
+  filter(is.na(name_facility))
+```
+
+### Group 5.1: Those observations where same name_owner appears twice
+
+```{r}
+occ_2_name_owner <- DOA_no_name_facility %>%
+  group_by(name_owner) %>%
+  filter(n() == 2) %>%  # Keep only groups with exactly 2 occurrence of name_owner
+  ungroup() %>%
+  arrange(name_owner)
+
+# This tells me that there are 4 facilities in Group 5.1 with 2 different id_operation_DOA
+owner_doa_check <- occ_2_name_owner %>%
+  group_by(name_owner) %>%
+  filter(!is.na(id_operation_DOA)) %>%
+  summarize(unique_doa_count = n_distinct(id_operation_DOA)) %>%
+  ungroup() 
+
+# This allowed me to check that there are NO facilities in occ_2_name_owner such that id_operation_DOA is NA
+owners_all_na_doa <- occ_2_name_owner %>%
+  group_by(name_owner) %>%
+  filter(all(is.na(id_operation_DOA))) %>%  # Keep groups where all id_operation_DOA values are NA
+  ungroup() 
+
+# Remove the 4 facilities that have more than 1 id_operation_DOA
+occ_2_name_owner_filtered <- occ_2_name_owner %>%
+  filter(!name_owner %in% c("Burnett Farms", "Carroll Family Farms Partnership", "Chris and Michelle Apke", "Wayne A. Bergbower"))
+
+# Count non-NA values for each row
+occ_2_name_owner_select <- occ_2_name_owner_filtered %>%
+  select(name_facility, name_owner, id_operation_DOA, county, animalTypes, address, lat_plss, lon_plss, lat_raw, lon_raw) %>%
+ mutate(non_na_count = rowSums(!is.na(.)))  
+
+# Group by name_owner and keep the row with the most non-NA values
+occ_2_name_owner_final <- occ_2_name_owner_select %>%
+  group_by(name_owner) %>%
+  slice_max(order_by = non_na_count, n = 1, with_ties = FALSE) %>%  # Keep the row with the most non-NA values
+  select(-non_na_count)  # Remove the helper column
+
+# Checked that occ_2_name_owner_final contains (1) each unique name_owner from occ_2_name_owner_filtered, (2) the address and coords for the facilities for which this information is given, and (3) the id_operation_DOA for each row (which corresponds to 1 name_owner)
+```
+
+### Group 5.2: The 4 facilities excluded previously (for which the same name_owner occupies 2 rows, each corresponding to a different id_operation_DOA)
+
+```{r}
+Fac_4 <- anti_join(occ_2_name_owner, occ_2_name_owner_filtered) %>%
+  select(name_facility, name_owner, id_operation_DOA, county, animalTypes, address, lat_plss, lon_plss, lat_raw, lon_raw)
+
+# The following dataset is saved and reviewed in Excel. Relevant entries from here are included in doa_final_gp1_gp2_gp4_gp5 (latest combined doa dataset).
+write.csv(Fac_4, file.path(file_path, "4 facilities.csv"), row.names = FALSE)
+```
+
+### Group 5.3: Those entries with no name_facility and same name_owner appears once or more than 2 times (i.e., facilities in DOA_no_name_facility but not in occ_2_name_owner)
+
+```{r}
+no_name_fac_rest <- anti_join(DOA_no_name_facility, occ_2_name_owner) %>%
+  select(name_facility, name_owner, id_operation_DOA, county, animalTypes, address, lat_plss, lon_plss, lat_raw, lon_raw)
+
+# Latest doa dataset with all of the above operations integrated
+doa_latest <- read_csv(file.path(file_path, "doa_final_gp1_gp2_gp4_gp5.csv"))
+
+# Entries in no_name_fac_rest for which id_operation_DOA is also present in doa_latest
+no_name_fac_rest_1 <- no_name_fac_rest %>% 
+  semi_join(doa_latest, by = "id_operation_DOA") %>%
+  filter(!is.na(id_operation_DOA))
+
+write.csv(no_name_fac_rest, file.path(file_path, "no_name_fac_rest.csv"), row.names = FALSE)
+
+# Reviewed this dataset and added relevant entries to doa_final_gp1_gp2_gp4_gp5. Approach: matched facilities in no_name_fac_rest_1 with the latest doa dataset (i.e., those with id_operation_DOA present in both latest doa dataset and no_name_fac_rest); then matched facilities in no_name_fac_rest that have address and coords given with facilities in the latest doa dataset. Then deleted redundant rows and collapsed to faciliy-by-name-owner level.
+```
+
+### Including facilities in group 5.1 to latest doa dataset
+
+```{r}
+doa_latest_2 <- read_csv(file.path(file_path, "doa_final_gp1_gp2_gp4_gp5.csv"))
+
+# Those in occ_2_name_owner_final where the id_operation_DOA is also present in doa_latest_2
+gp_5_1_filtered <- occ_2_name_owner_final %>% 
+  semi_join(doa_latest_2, by = "id_operation_DOA") 
+
+# Add a flag column to mark rows that are in gp_5_1_filtered
+occ_2_name_owner_final <- occ_2_name_owner_final %>%
+  mutate(
+    marked = if_else(id_operation_DOA %in% gp_5_1_filtered$id_operation_DOA, "Yes", "No")
+  )
+  
+write.csv(occ_2_name_owner_final, file.path(file_path, "gp_5.1.csv"), row.names = FALSE)
+
+# Reviewed this in Excel and added relevant entries to doa_final_gp1_gp2_gp4_gp5. Approach: matched facilities in gp_5_1_filtered with latest doa dataset (i.e., those with id_operation_DOA present in both latest doa dataset and occ_2_name_owner_final); then matched facilities in occ_2_name_owner_final that have address and coords given with the facilities in the latest doa dataset. Can't do much with the rest (that have no address/coords info and no matching id_operation_DOA so they are just included as individual facilities.
+
+```
+
+## Final DOA dataset
+
+```{r}
+
+doa_final_gp1_gp2_gp4_gp5 <- read_csv(file.path(file_path, "doa_final_gp1_gp2_gp4_gp5.csv"))
+
+# Filter rows where either id_operation_DOA or my_Id_facility_doa is NA (final check)
+na_entries <- doa_final_gp1_gp2_gp4_gp5 %>%
+  filter(is.na(id_operation_DOA) | is.na(my_Id_facility_doa))
+
+# Combine animalTypes for each unique my_Id_facility_doa
+doa_final <- doa_final_gp1_gp2_gp4_gp5 %>%
+  group_by(my_Id_facility_doa) %>%
+  mutate(animalTypes = paste(unique(animalTypes), collapse = "; ")) %>%
+  ungroup() # This is my final IL DOA dataset
+write.csv(doa_final, file.path(file_path, "IL-DOA_final.csv"), row.names = FALSE)
+
+# Rows in doa dataset for which coords are all NA but address is not
+num_unique_missing_coords <- doa_final %>%
+  filter(!is.na(address) & is.na(lat_plss) & is.na(lon_plss) & is.na(lat_raw) & is.na(lon_raw)) #436 rows (not unique facilities that have an address but not coords)
+
+
+# Rows in doa dataset for which address and coords are all NA
+num_unique_missing_loc <- doa_final %>%
+  filter(is.na(address) & is.na(lat_plss) & is.na(lon_plss) & is.na(lat_raw) & is.na(lon_raw)) # 471 such rows
+
+
+# Remove rows where all specified columns are NA (this dataset still has facilities which have an address, but NA for the coord columns)
+doa_final_cleaned <- doa_final %>%
+  filter(!(is.na(address) & is.na(lat_plss) & is.na(lon_plss) & is.na(lat_raw) & is.na(lon_raw))) %>% 
+  filter(!grepl("\\b(RR|Box)\\b", address, ignore.case = TRUE)) #removed all rows where the address has RR or Box 
+
+doa_final_cleaned <- doa_final_cleaned %>%
+  mutate(
+    # Create new lat_doa and lon_doa columns
+    lat_doa = ifelse(!is.na(lat_plss), lat_plss, lat_raw),
+    lon_doa = ifelse(!is.na(lon_plss), lon_plss, lon_raw)
+  ) %>%
+  # Remove the original lat_plss, lon_plss, lat_raw, lon_raw columns
+  select(-lat_plss, -lon_plss, -lat_raw, -lon_raw)
+
+# For each row, if lat_plss and lon_plss are not NA, those values are used for lat_doa and lon_doa. If lat_plss and lon_plss are NA, the corresponding lat_raw and lon_raw values are used instead.
+
+
+# Number of unique facilities in doa vs epa dataset
+
+raw_IL_EPA_2 <- read_csv("/Users/zarrinali/Documents/AFOs_IL/dataRAW_Zarrin/raw_IL-EPA-2.csv")
+  
+num_unique_facilities_doa <- doa_final_cleaned %>%
+  summarise(unique_facilities = n_distinct(my_Id_facility_doa))
+num_unique_facilities_epa <- raw_IL_EPA_2 %>%
+  summarise(unique_facilities = n_distinct(myId_facility_epa)) # 1181 doa facilities vs 814 epa facilities
+
+```
+
+------------------------------------------------------------------------
+
+# EPA-DOA matching
+
+```{r}
+file_path_2 <- "/Users/zarrinali/Documents/AFOs_IL/dataINTERM_Zarrin/DOA-EPA matching"
+
+epa_final <- raw_IL_EPA_2 %>%
+  select(name_facility, name_operator, myId_facility_epa, npdes, county, animalTypes, address, lat, lon) 
+  
+epa_final_cleaned <- epa_final %>%
+  filter(!(is.na(address) & is.na(lat) & is.na(lon))) %>% 
+  filter(!grepl("\\b(RR|Box)\\b", address, ignore.case = TRUE)) # removed all rows where address and coords were NA OR coords were NA, there was an address but the address contained the words RR or box
+
+
+# Matching epa-doa dataset by name_facility
+matches_raw_doa_epa <- fuzzyjoin::stringdist_join(
+  x = doa_final_cleaned,
+  y = epa_final_cleaned,
+  by = "name_facility",
+  method = 'cosine',
+  max_dist = 10,
+  mode = 'left', # left join includes all rows from doa_final and matched rows epa_final
+  ignore_case = T,
+  distance_col = "distance" # store the string distances
+)
+
+matches_raw_doa_epa <- matches_raw_doa_epa %>%
+  select(name_facility.x, name_facility.y, distance, name_owner, name_operator, my_Id_facility_doa, myId_facility_epa, address.x, address.y, county.x, county.y, animalTypes.x, animalTypes.y, lat_doa, lon_doa, lat, lon, everything()) %>%
+  rename(name_facility_doa = name_facility.x, name_facility_epa = name_facility.y, name_owner_doa = name_owner, name_operator_epa = name_operator, address_doa = address.x, address_epa = address.y, county_doa = county.x, county_epa = county.y, animalTypes_doa = animalTypes.x, animalTypes_epa = animalTypes.y, lat_epa = lat, lon_epa = lon)
+
+# Filter: drop very bad matches and keep 5 best matches -> drop matches for which county doesn't match then keep 5 best matches
+matches_filtered_doa_epa <- matches_raw_doa_epa %>%
+  filter(county_doa==county_epa) %>% # Filter out matches that are not in the same county
+  select(-county_epa) %>%
+  rename(county = county_doa) %>%
+  group_by(my_Id_facility_doa) %>% # Each facility is identified by the unique facility identifier I created before
+  arrange(distance) %>%
+  filter(row_number()<=5) # then keep the 5 best matches for each facility
+
+# Simplifying dataset for determining threshold
+matches_filtered_doa_epa_1 <- matches_filtered_doa_epa %>%
+  filter(distance != 0) # Determine the threshold for high-quality matches using this dataset
+
+# High quality matches
+matched_doa_epa_good <- matches_filtered_doa_epa %>%
+  filter(distance < 0.1) %>%
+  group_by(my_Id_facility_doa) %>%
+  filter(distance==min(distance)) %>% ungroup # For each doa facility (as identified by the unique identifier), keep the match with the smallest dist
+
+# Remaining matches 
+matched_doa_epa_not_good <- matches_filtered_doa_epa %>%
+  anti_join(matched_doa_epa_good %>% select(my_Id_facility_doa), by = "my_Id_facility_doa") %>% # Excludes doa facilities already in the good matches dataset
+  arrange(my_Id_facility_doa, distance) # Groups doa facilities together and arranges by distance
+
+```
+
+## Create 3 different groups of matches for separate treatment
+
+```{r}
+# Group 1: Matches for which name_facility_doa = name_facility_epa
+matched_gp1_doa_epa <- matched_doa_epa_good %>% 
+  filter(distance == 0) %>%
+  mutate(state = "IL", lat_correct = NA, lon_correct = NA, address_correct = NA, comment = NA, id_new_likeNPDES = NA) %>%
+  select(state, id_operation_DOA, my_Id_facility_doa, name_owner_doa, name_facility_doa, npdes, id_new_likeNPDES, myId_facility_epa, name_facility_epa, lat_doa, lon_doa, lat_epa, lon_epa, lat_correct, lon_correct, address_doa, address_epa, address_correct, animalTypes_doa, animalTypes_epa, comment) %>%
+  arrange(my_Id_facility_doa, myId_facility_epa)
+
+write.csv(matched_gp1_doa_epa, file.path(file_path_2, "gp_1_doa_epa.csv"), row.names = FALSE)
+
+# Group 2: High quality matches for which name_facility_doa is NOT same as name_facility_epa (0 < dist < 0.1)
+matched_gp2_doa_epa <- matched_doa_epa_good %>% 
+  filter(distance != 0) %>% # Only the match with the minimum distance is kept for each name_facility_doa
+  mutate(state = "IL", lat_correct = NA, lon_correct = NA, address_correct = NA, comment = NA, id_new_likeNPDES = NA) %>%
+  select(state, id_operation_DOA, my_Id_facility_doa, name_owner_doa, name_facility_doa, npdes, id_new_likeNPDES, myId_facility_epa, name_operator_epa, name_facility_epa, lat_doa, lon_doa, lat_epa, lon_epa, lat_correct, lon_correct, address_doa, address_epa, address_correct, animalTypes_doa, animalTypes_epa, comment) %>%
+  arrange(my_Id_facility_doa, myId_facility_epa)
+
+write.csv(matched_gp2_doa_epa, file.path(file_path_2, "gp_2_doa_epa.csv"), row.names = FALSE)
+
+# Group 3: Remaining matches (excludes doa facility Ids already in groups 1 and 2)
+matched_gp3_doa_epa <-matched_doa_epa_not_good %>%
+  mutate(state = "IL", lat_correct = NA, lon_correct = NA, address_correct = NA, comment = NA, id_new_likeNPDES = NA) %>%
+  select(state, id_operation_DOA, my_Id_facility_doa, name_owner_doa, name_facility_doa, npdes, id_new_likeNPDES, myId_facility_epa, name_operator_epa, name_facility_epa, distance, lat_doa, lon_doa, lat_epa, lon_epa, lat_correct, lon_correct, address_doa, address_epa, address_correct, animalTypes_doa, animalTypes_epa, comment) %>%
+  arrange(my_Id_facility_doa, distance) # For each doa facility, the best 5 matches are kept and arranged by distance
+
+write.csv(matched_gp3_doa_epa, file.path(file_path_2, "gp_3_doa_epa.csv"), row.names = FALSE)
+
+
+```
+
+## Group 1: Matches for which facility name matches exactly
+
+```{r}
+# Checking coords to see if the matches for epa and doa facilities are within a reasonable distance 
+
+# Load required package
+library(geosphere)
+
+matched_gp1_doa_epa <- matched_gp1_doa_epa %>%
+  mutate(
+    distance = ifelse(
+      is.na(lat_doa) | is.na(lon_doa) | is.na(lat_epa) | is.na(lon_epa), 
+      NA, 
+      distHaversine(cbind(lon_doa, lat_doa), cbind(lon_epa, lat_epa))
+    )
+  ) %>%
+  select(my_Id_facility_doa, name_facility_doa, name_facility_epa, address_doa, address_epa, distance, everything())
+
+
+# Dataset where distance is less than 2100 meters (these are matches across the 2 datasets)
+matched_distance_less_2100 <- matched_gp1_doa_epa %>%
+  filter(!is.na(distance) & distance < 2100) %>%
+  select(address_doa, address_epa, distance, lat_doa, lon_doa, lat_epa, lon_epa, everything()) #to be added to final dataset
+
+# Dataset where distance is greater than 2100 meters (these are not matches)
+matched_distance_greater_2100 <- matched_gp1_doa_epa %>%
+  filter(!is.na(distance) & distance > 2100)
+
+# Dataset where distance is NA (have to manually check these in Excel)
+matched_distance_na <- matched_gp1_doa_epa %>%
+  filter(is.na(distance))
+write.csv(matched_distance_na, file.path(file_path_2, "matched_distance_na.csv"), row.names = FALSE) #Export to Excel
+
+# Coords distance is NA but manually checked in Excel (using given address/coords) that these are matches
+
+yes_matches_distance_na <- read_csv(file.path(file_path_2, "yes_matches_distance_na.csv")) #to be added to final dataset
+
+# Coords distance is NA and checked manually that these are NOT matches
+no_matches_dist_na <- read_csv(file.path(file_path_2, "no_matches_dist_na.csv"))
+
+# Merge the two datasets that do not have matches
+merged_no_matches <- bind_rows(no_matches_dist_na, matched_distance_greater_2100) #each of these facilities (doa and epa) have to be separately added to the final dataset
+  
+```
+
+### Prep the final datasets in Group 1
+
+```{r}
+# matched_distance_less_2100
+
+
+# Find cases where the same my_Id_facility_doa is matched to multiple myId_facility_epa
+doa_to_multiple_epa <- matched_distance_less_2100 %>%
+  group_by(my_Id_facility_doa) %>%
+  filter(n_distinct(myId_facility_epa) > 1) %>%
+  ungroup()
+
+# Find cases where the same myId_facility_epa is matched to multiple my_Id_facility_doa
+epa_to_multiple_doa <- matched_distance_less_2100 %>%
+  group_by(myId_facility_epa) %>%
+  filter(n_distinct(my_Id_facility_doa) > 1) %>%
+  ungroup()
+
+# Combine the results to see all problematic rows
+problematic_rows <- bind_rows(doa_to_multiple_epa, epa_to_multiple_doa) %>%
+  distinct()
+write.csv(problematic_rows, file.path(file_path_2, "problematic_rows.csv"), row.names = FALSE)
+
+#In Excel I deleted the rows that were not matches so that now every unique my_Id_facility_doa is mapped to one unique myId_facility_epa
+problematic_rows_solved <- read_csv(file.path(file_path_2, "problematic_rows_solved.csv"))
+
+
+matched_dist_less_2100_combined <- matched_distance_less_2100 %>%
+  anti_join(problematic_rows) %>% 
+  bind_rows(problematic_rows_solved)
+
+
+# Cleaning up the data
+
+matched_dist_less_2100_final <- matched_dist_less_2100_combined %>%
+  mutate(
+    # Fill address_correct with the longest entry between address_doa and address_epa, considering NA values
+    address_correct = case_when(
+      is.na(address_doa) ~ address_epa,  # Use address_epa if address_doa is NA
+      is.na(address_epa) ~ address_doa,  # Use address_doa if address_epa is NA
+      nchar(address_epa) > nchar(address_doa) ~ address_epa,  # Use address_epa if it's longer
+      TRUE ~ address_doa  # Otherwise, use address_doa
+    ),
+    # Fill lat_correct with lat_epa if available, otherwise lat_doa
+    lat_correct = ifelse(!is.na(lat_epa), lat_epa, lat_doa),
+    # Fill lon_correct with lon_epa if available, otherwise lon_doa
+    lon_correct = ifelse(!is.na(lon_epa), lon_epa, lon_doa)
+  ) %>%
+   select(state, name_facility_epa, myId_facility_epa, id_operation_DOA, name_owner_doa, name_facility_doa, my_Id_facility_doa, lat_correct, lon_correct, address_correct) # THIS DATASET IS COMPLETE
+
+```
+
+```{r}
+# yes_matches_distance_na
+
+
+# Find cases where the same my_Id_facility_doa is matched to multiple myId_facility_epa
+doa_to_multiple_epa_1 <- yes_matches_distance_na %>%
+  group_by(my_Id_facility_doa) %>%
+  filter(n_distinct(myId_facility_epa) > 1) %>%
+  ungroup() # NO ENTRIES
+
+# Find cases where the same myId_facility_epa is matched to multiple my_Id_facility_doa
+epa_to_multiple_doa_1 <- yes_matches_distance_na %>%
+  group_by(myId_facility_epa) %>%
+  filter(n_distinct(my_Id_facility_doa) > 1) %>%
+  ungroup() #NO ENTRIES
+
+
+
+
+# Cleaning up the data
+
+yes_matches_distance_na_final <- yes_matches_distance_na %>%
+  mutate(
+    # Fill address_correct with the longest entry between address_doa and address_epa, considering NA values
+    address_correct = case_when(
+      is.na(address_doa) ~ address_epa,  # Use address_epa if address_doa is NA
+      is.na(address_epa) ~ address_doa,  # Use address_doa if address_epa is NA
+      nchar(address_epa) > nchar(address_doa) ~ address_epa,  # Use address_epa if it's longer
+      TRUE ~ address_doa  # Otherwise, use address_doa
+    ),
+    # Fill lat_correct with lat_epa if available, otherwise lat_doa
+    lat_correct = ifelse(!is.na(lat_epa), lat_epa, lat_doa),
+    # Fill lon_correct with lon_epa if available, otherwise lon_doa
+    lon_correct = ifelse(!is.na(lon_epa), lon_epa, lon_doa)
+  ) %>%
+   select(state, name_facility_epa, myId_facility_epa, id_operation_DOA, name_owner_doa, name_facility_doa, my_Id_facility_doa, lat_correct, lon_correct, address_correct) # THIS DATASET IS COMPLETE
+
+```
+
+------------------------------------------------------------------------
+
+## Group 2: Matches for which facility name string dist is between 0 and 0.1
+
+```{r}
+# Checking coords to see if the matches for epa and doa facilities are within a reasonable distance 
+
+# Load required package
+library(geosphere)
+
+# Suppress scientific notation
+options(scipen = 999)
+
+# Compute coords distances and update the dataset
+matched_gp2_doa_epa <- matched_gp2_doa_epa %>%
+  mutate(
+    distance = ifelse(
+      is.na(lat_doa) | is.na(lon_doa) | is.na(lat_epa) | is.na(lon_epa), 
+      NA, 
+      distHaversine(cbind(lon_doa, lat_doa), cbind(lon_epa, lat_epa))
+    )
+  ) %>%
+  select(my_Id_facility_doa, name_facility_doa, name_facility_epa, address_doa, address_epa, distance, everything())
+
+
+# Dataset where distance is less than 1000 meters (these are matches across the 2 datasets)
+matched_distance_less_1000 <- matched_gp2_doa_epa %>%
+  filter(!is.na(distance) & distance < 1000) %>%
+  select(address_doa, address_epa, distance, lat_doa, lon_doa, lat_epa, lon_epa, everything()) #to be added to final dataset
+
+# Dataset where distance is greater than 1000 meters (these are not matches)
+matched_distance_greater_1000 <- matched_gp2_doa_epa %>%
+  filter(!is.na(distance) & distance > 1000)
+
+# Dataset where distance is NA (have to manually check these in Excel)
+matched_distance_na_gp2 <- matched_gp2_doa_epa %>%
+  filter(is.na(distance))
+write.csv(matched_distance_na_gp2, file.path(file_path_2, "matched_distance_na_gp2.csv"), row.names = FALSE) # manually check in Excel if these are matches since dist b/w epa and doa coords is NA
+
+
+
+# Coords distance is NA but manually checked in Excel (using given address/coords) that these are matches
+yes_matches_dist_na_gp2 <- read_csv(file.path(file_path_2, "yes_matches_dist_na_gp2.csv")) #to be added to final dataset
+
+# Coords distance is NA and checked manually that these are NOT matches
+no_matches_dist_na_gp2 <- read_csv(file.path(file_path_2, "no_matches_dist_na_gp2.csv"))
+
+# Merge the two datasets that do not have matches
+merged_no_matches_2 <- bind_rows(no_matches_dist_na_gp2, matched_distance_greater_1000) #each of these facilities (doa and epa) have to be separately added to the final dataset
+
+```
+
+### Prep the final datasets in Group 2
+
+```{r}
+# matched_distance_less_1000
+
+
+# Find cases where the same my_Id_facility_doa is matched to multiple myId_facility_epa
+doa_to_multiple_epa_2 <- matched_distance_less_1000 %>%
+  group_by(my_Id_facility_doa) %>%
+  filter(n_distinct(myId_facility_epa) > 1) %>%
+  ungroup() #NO ENTRIES
+
+# Find cases where the same myId_facility_epa is matched to multiple my_Id_facility_doa
+epa_to_multiple_doa_2 <- matched_distance_less_1000 %>%
+  group_by(myId_facility_epa) %>%
+  filter(n_distinct(my_Id_facility_doa) > 1) %>%
+  ungroup() # 2 entries here. This is a mistake on my part because the same doa facility is given two different my_Id_facility_doa.
+
+#Fixing the above mistake
+matched_distance_less_1000 <- matched_distance_less_1000 %>% mutate(my_Id_facility_doa = ifelse(id_operation_DOA == "LF143013", "ildoa_1394", my_Id_facility_doa))
+
+# Fixing the myId_facility_doa in doa_final_cleaned which will be the dataset used to identify facilities that have no matches
+doa_final_cleaned <- doa_final_cleaned %>% mutate(my_Id_facility_doa = ifelse(my_Id_facility_doa == "ildoa_1395", "ildoa_1394", my_Id_facility_doa))
+
+
+
+# Cleaning up the data
+matched_distance_less_1000_final <- matched_distance_less_1000 %>%
+  mutate(
+    # Fill address_correct with the longest entry between address_doa and address_epa, considering NA values
+    address_correct = case_when(
+      is.na(address_doa) ~ address_epa,  # Use address_epa if address_doa is NA
+      is.na(address_epa) ~ address_doa,  # Use address_doa if address_epa is NA
+      nchar(address_epa) > nchar(address_doa) ~ address_epa,  # Use address_epa if it's longer
+      TRUE ~ address_doa  # Otherwise, use address_doa
+    ),
+    # Fill lat_correct with lat_epa if available, otherwise lat_doa
+    lat_correct = ifelse(!is.na(lat_epa), lat_epa, lat_doa),
+    # Fill lon_correct with lon_epa if available, otherwise lon_doa
+    lon_correct = ifelse(!is.na(lon_epa), lon_epa, lon_doa)
+  ) %>%
+   select(state, name_facility_epa, myId_facility_epa, id_operation_DOA, name_owner_doa, name_facility_doa, my_Id_facility_doa, lat_correct, lon_correct, address_correct) # THIS DATASET IS COMPLETE
+
+```
+
+```{r}
+# yes_matches_dist_na_gp2
+
+# Find cases where the same my_Id_facility_doa is matched to multiple myId_facility_epa
+doa_to_multiple_epa_3 <- yes_matches_dist_na_gp2 %>%
+  group_by(my_Id_facility_doa) %>%
+  filter(n_distinct(myId_facility_epa) > 1) %>%
+  ungroup() #NO ENTRIES
+
+# Find cases where the same myId_facility_epa is matched to multiple my_Id_facility_doa
+epa_to_multiple_doa_3 <- yes_matches_dist_na_gp2 %>%
+  group_by(myId_facility_epa) %>%
+  filter(n_distinct(my_Id_facility_doa) > 1) %>%
+  ungroup() #NO ENTRIES
+
+
+# Cleaning up the data
+yes_matches_dist_na_gp2_final <- yes_matches_dist_na_gp2 %>%
+  mutate(
+    # Fill address_correct with the longest entry between address_doa and address_epa, considering NA values
+    address_correct = case_when(
+      is.na(address_doa) ~ address_epa,  # Use address_epa if address_doa is NA
+      is.na(address_epa) ~ address_doa,  # Use address_doa if address_epa is NA
+      nchar(address_epa) > nchar(address_doa) ~ address_epa,  # Use address_epa if it's longer
+      TRUE ~ address_doa  # Otherwise, use address_doa
+    ),
+    # Fill lat_correct with lat_epa if available, otherwise lat_doa
+    lat_correct = ifelse(!is.na(lat_epa), lat_epa, lat_doa),
+    # Fill lon_correct with lon_epa if available, otherwise lon_doa
+    lon_correct = ifelse(!is.na(lon_epa), lon_epa, lon_doa)
+  ) %>%
+   select(state, name_facility_epa, myId_facility_epa, id_operation_DOA, name_owner_doa, name_facility_doa, my_Id_facility_doa, lat_correct, lon_correct, address_correct) # THIS DATASET IS COMPLETE
+
+```
+
+------------------------------------------------------------------------
+
+## Group 3: Low quality matches of facility names
+
+```{r}
+# Load the stringdist package
+library(stringdist)
+
+
+# Checking coords to see if the matches for epa and doa facilities are within a reasonable distance 
+matched_gp3_doa_epa <- matched_gp3_doa_epa %>%
+  mutate(
+    coordsdist = ifelse(
+      is.na(lat_doa) | is.na(lon_doa) | is.na(lat_epa) | is.na(lon_epa), 
+      NA, 
+      distHaversine(cbind(lon_doa, lat_doa), cbind(lon_epa, lat_epa))
+    )
+  ) %>%
+  select(my_Id_facility_doa, name_facility_doa, name_facility_epa, address_doa, address_epa, distance, coordsdist, everything())
+
+
+# Dataset where coords distance is NA (have to manually check these in Excel)
+matched_distance_na_gp3 <- matched_gp3_doa_epa %>%
+  filter(is.na(coordsdist)) #956 entries
+
+# Impossible to go through 956 entries to find matches, so find the string distance between the address_doa and address_epa and if it is below a certain threshold then check if it is a match
+# Add a new column with the cosine string distance between address_doa and address_epa
+matched_distance_na_gp3 <- matched_distance_na_gp3 %>%
+  mutate(
+    addressdist = stringdist(address_doa, address_epa, method = "cosine")
+  ) %>%
+  select(name_facility_doa, name_facility_epa, address_doa, address_epa, addressdist, distance, coordsdist, everything())
+
+# Filter rows where addressdist < 0.13 or addressdist is NA (these could be matches, so check in Excel)
+matched_dist_na_gp3_1 <- matched_distance_na_gp3 %>%
+  filter(is.na(addressdist) | addressdist < 0.13) # manually check this dataset
+write.csv(matched_dist_na_gp3_1, file.path(file_path_2, "matched_dist_na_gp3_1.csv"), row.names = FALSE) #check in Excel
+
+# From Excel (I very carefully made sure to evaluate matches for which addressdist < 0.13 but for the ones where addressdist is NA, I only checked a few (b/c it seemed extremely unlikely that there were any matches))
+good_dist_na_gp3 <- read_csv(file.path(file_path_2,"good_dist_na_gp3.csv")) # matches
+bad_dist_na_gp3 <- read_csv(file.path(file_path_2, "bad_dist_na_gp3.csv")) # no matches
+
+
+# NO MATCHES
+no_matches_dist_na_gp3 <- bind_rows(matched_distance_na_gp3 %>% filter(addressdist > 0.13), bad_dist_na_gp3)
+
+
+
+#Dataset where coords dist < 2000 (these could be potential matches but I will check further in Excel)
+matched_dist_less_2000 <- matched_gp3_doa_epa %>%
+  filter(!is.na(coordsdist) & coordsdist < 2000) %>%
+  select(address_doa, address_epa, coordsdist, lat_doa, lon_doa, lat_epa, lon_epa, everything()) #manually check in Excel
+write.csv(matched_dist_less_2000, file.path(file_path_2, "matched_dist_less_2000.csv"), row.names = FALSE)
+
+# From Excel
+yes_matches_dist_less_2000 <- read_csv(file.path(file_path_2, "yes_matches_dist_less_2000.csv")) # matches
+
+no_matches_dist_less_2000 <- read_csv(file.path(file_path_2, "no_matches_dist_less_2000.csv")) #NO MATCHES
+
+# NO MATCHES 
+dist_greater_2000 <- matched_gp3_doa_epa %>%
+  filter(coordsdist > 2000)
+
+# Merge the 3 datasets in Group 3 that do not have any matches
+merged_no_matches_3 <- bind_rows(no_matches_dist_na_gp3, no_matches_dist_less_2000, dist_greater_2000) #each of these facilities (doa and epa) have to be separately added to the final dataset
+```
+
+### Prep the final datasets in Group 3
+
+```{r}
+# good_dist_na_gp3
+
+# Find cases where the same my_Id_facility_doa is matched to multiple myId_facility_epa
+doa_to_multiple_epa_4 <- good_dist_na_gp3 %>%
+  group_by(my_Id_facility_doa) %>%
+  filter(n_distinct(myId_facility_epa) > 1) %>%
+  ungroup() # No entries
+
+# Find cases where the same myId_facility_epa is matched to multiple my_Id_facility_doa
+epa_to_multiple_doa_4 <- good_dist_na_gp3 %>%
+  group_by(myId_facility_epa) %>%
+  filter(n_distinct(my_Id_facility_doa) > 1) %>%
+  ungroup() # 5 entries. This is a mistake on my part because the same doa facility is given 3 different my_Id_facility_doa.
+
+# Fixing the above mistake
+good_dist_na_gp3 <- good_dist_na_gp3 %>% mutate(my_Id_facility_doa = ifelse(address_doa == "23318 W Taggert Rd, Elmwood, IL 61529", "ildoa_319", my_Id_facility_doa))
+
+# Fixing the myId_facility_doa in doa_final_cleaned which will be the dataset used to identify facilities that have no matches
+doa_final_cleaned <- doa_final_cleaned %>% mutate(my_Id_facility_doa = ifelse(my_Id_facility_doa == "ildoa_491", "ildoa_319", my_Id_facility_doa)) %>%
+  mutate(my_Id_facility_doa = ifelse(my_Id_facility_doa == "ildoa_760", "ildoa_319", my_Id_facility_doa))
+
+
+# Cleaning up the data
+good_dist_na_gp3_final <- good_dist_na_gp3 %>%
+  mutate(
+    # Fill address_correct with the longest entry between address_doa and address_epa, considering NA values
+    address_correct = case_when(
+      is.na(address_doa) ~ address_epa,  # Use address_epa if address_doa is NA
+      is.na(address_epa) ~ address_doa,  # Use address_doa if address_epa is NA
+      nchar(address_epa) > nchar(address_doa) ~ address_epa,  # Use address_epa if it's longer
+      TRUE ~ address_doa  # Otherwise, use address_doa
+    ),
+    # Fill lat_correct with lat_epa if available, otherwise lat_doa
+    lat_correct = ifelse(!is.na(lat_epa), lat_epa, lat_doa),
+    # Fill lon_correct with lon_epa if available, otherwise lon_doa
+    lon_correct = ifelse(!is.na(lon_epa), lon_epa, lon_doa)
+  ) %>%
+   select(state, name_facility_epa, myId_facility_epa, id_operation_DOA, name_owner_doa, name_facility_doa, my_Id_facility_doa, lat_correct, lon_correct, address_correct) # THIS DATASET IS COMPLETE
+
+```
+
+```{r}
+# yes_matches_dist_less_2000
+
+# Find cases where the same my_Id_facility_doa is matched to multiple myId_facility_epa
+doa_to_multiple_epa_5 <- yes_matches_dist_less_2000 %>%
+  group_by(my_Id_facility_doa) %>%
+  filter(n_distinct(myId_facility_epa) > 1) %>%
+  ungroup() # 2 entries
+
+# Fixing the problem because the two different myId_facility_epa are referring to the same facility
+yes_matches_dist_less_2000 <- yes_matches_dist_less_2000 %>% mutate(myId_facility_epa = ifelse(my_Id_facility_doa == "ildoa_513", "ilepa_578", myId_facility_epa))
+
+# Fixing the myId_facility_epa in epa_final_cleaned which will be one of the two datasets used to identify facilities that have no matches
+epa_final_cleaned <- epa_final_cleaned %>% mutate(myId_facility_epa = ifelse(myId_facility_epa == "ilepa_727", "ilepa_578", myId_facility_epa))
+
+
+# Find cases where the same myId_facility_epa is matched to multiple my_Id_facility_doa
+epa_to_multiple_doa_5 <- yes_matches_dist_less_2000 %>%
+  group_by(myId_facility_epa) %>%
+  filter(n_distinct(my_Id_facility_doa) > 1) %>%
+  ungroup() # 11 entries
+
+# Fixing the problem b/c two different my_Id_facility_doa are referring to the same facility
+yes_matches_dist_less_2000 <- yes_matches_dist_less_2000 %>% mutate(my_Id_facility_doa = ifelse(myId_facility_epa == "ilepa_152", "ildoa_961", my_Id_facility_doa)) %>%
+  mutate(my_Id_facility_doa = ifelse(myId_facility_epa == "ilepa_571", "ildoa_761", my_Id_facility_doa))
+
+# Fixing the myId_facility_doa in doa_final_cleaned which will be the dataset used to identify facilities that have no matches
+doa_final_cleaned <- doa_final_cleaned %>% mutate(my_Id_facility_doa = ifelse(my_Id_facility_doa == "ildoa_1004", "ildoa_961", my_Id_facility_doa)) %>%
+  mutate(my_Id_facility_doa = ifelse(my_Id_facility_doa == "ildoa_1415", "ildoa_761", my_Id_facility_doa))
+
+
+# Cleaning up the data
+yes_matches_dist_less_2000_final <- yes_matches_dist_less_2000 %>%
+  mutate(
+    # Fill address_correct with the longest entry between address_doa and address_epa, considering NA values
+    address_correct = case_when(
+      is.na(address_doa) ~ address_epa,  # Use address_epa if address_doa is NA
+      is.na(address_epa) ~ address_doa,  # Use address_doa if address_epa is NA
+      nchar(address_epa) > nchar(address_doa) ~ address_epa,  # Use address_epa if it's longer
+      TRUE ~ address_doa  # Otherwise, use address_doa
+    ),
+    # Fill lat_correct with lat_epa if available, otherwise lat_doa
+    lat_correct = ifelse(!is.na(lat_epa), lat_epa, lat_doa),
+    # Fill lon_correct with lon_epa if available, otherwise lon_doa
+    lon_correct = ifelse(!is.na(lon_epa), lon_epa, lon_doa)
+  ) %>%
+   select(state, name_facility_epa, myId_facility_epa, id_operation_DOA, name_owner_doa, name_facility_doa, my_Id_facility_doa, lat_correct, lon_correct, address_correct) # THIS DATASET IS COMPLETE
+
+```
+
+------------------------------------------------------------------------
+
+# Creating the epa-doa dataset
+
+```{r}
+carroll <- read_csv(file.path(file_path_2, "CarrollFarms_match_doa-epa.csv")) # matched by Claire
+
+
+matches_carrollfarms <- read_csv(file.path(file_path_2, "new_CarrollFarms_match_doa-epa.csv")) #clean version
+
+matches <- bind_rows(matched_dist_less_2100_final, yes_matches_distance_na_final, matched_distance_less_1000_final, yes_matches_dist_na_gp2_final, good_dist_na_gp3_final, yes_matches_dist_less_2000_final)
+
+common_rows <- matches_carrollfarms %>%
+  semi_join(matches, by = "id_operation_DOA") # 2 common rows between carroll farms and matches dataset
+
+# Remove rows from matches that match id_operation_DOA in matches_carrollfarms
+matches_1 <- matches %>%
+  anti_join(matches_carrollfarms, by = "id_operation_DOA")
+
+
+matches_2 <- bind_rows(matches_1, matches_carrollfarms)
+
+
+
+# Find cases where the same my_Id_facility_doa is matched to multiple myId_facility_epa
+doa_to_multiple_epa_6 <- matches_2 %>%
+  group_by(my_Id_facility_doa) %>%
+  filter(n_distinct(myId_facility_epa) > 1) %>%
+  ungroup() #No entries
+
+# Find cases where the same myId_facility_epa is matched to multiple my_Id_facility_doa
+epa_to_multiple_doa_6 <- matches_2 %>%
+  group_by(myId_facility_epa) %>%
+  filter(n_distinct(my_Id_facility_doa) > 1) %>%
+  ungroup() # 39 entries
+
+# Fixing the issue in Excel
+write.csv(matches_2, file.path(file_path_2, "matches_2.csv"), row.names = FALSE)
+write.csv(doa_final_cleaned, file.path(file_path_2, "doa_final_cleaned.csv"), row.names = FALSE) # I deleted a couple of rows which werent actually matches and for the others there was a mistake (for instance, the same facility was given two different facility IDs) - fixed the IDs both in matches_2 and doa_final_cleaned
+
+# From Excel
+matches_3 <- read_csv(file.path(file_path_2, "matches_2_sorted.csv"))
+doa_final_cleaned_1 <- read_csv(file.path(file_path_2, "doa_final_cleaned_sorted.csv"))
+
+epa_to_multiple_doa_6_1 <- matches_3 %>%
+  group_by(myId_facility_epa) %>%
+  filter(n_distinct(my_Id_facility_doa) > 1) %>%
+  ungroup() # NO ENTRIES - just checked to see if all the problem rows had been fixed
+
+
+
+# Get rows from doa_final_cleaned_1 where my_Id_facility_doa is not in matches_3
+doa_not_in_matches <- doa_final_cleaned_1 %>%
+  anti_join(matches_3, by = "my_Id_facility_doa")
+
+# Remove rows from doa_not_in_matches based on the following conditions
+doa_not_in_matches_cleaned <- doa_not_in_matches %>%
+  filter(is.na(id_operation_DOA) | ( # Leave rows with NA as they are
+      !id_operation_DOA %in% carroll$id_operation_DOA & # Exclude rows matching carroll farms
+      !id_operation_DOA %in% c("LF067035", "LF067046")  # Exclude rows with these two IDs which also correspond to carroll farms
+    )
+  )
+
+# Get rows from epa_final_cleaned where myId_facility_epa is not in matches_3
+epa_not_in_matches <- epa_final_cleaned %>%
+  anti_join(matches_3, by = "myId_facility_epa")
+
+# Remove rows with npdes in carroll
+epa_not_in_matches_cleaned <- epa_not_in_matches %>%
+  filter(
+    is.na(npdes) | # Leave rows with NA as they are
+      (!npdes %in% carroll$npdes) # Exclude rows with npdes in carroll farms
+  )
+
+
+doa_not_in_matches_final <- doa_not_in_matches_cleaned %>%
+  select(-county, -animalTypes, # Remove unwanted columns
+    name_facility_doa = name_facility,
+    name_owner_doa = name_owner,
+    address_correct = address, 
+    lat_correct = lat_doa, 
+    lon_correct = lon_doa
+  ) %>%
+  mutate(
+    state = "IL", name_facility_epa = NA, myId_facility_epa = NA)
+
+
+
+epa_not_in_matches_final <- epa_not_in_matches_cleaned %>%
+  select(
+    -name_operator, -npdes, -county, -animalTypes, # Remove unwanted columns
+    name_facility_epa = name_facility,            # Rename columns
+    address_correct = address, 
+    lat_correct = lat, 
+    lon_correct = lon
+  ) %>%
+  mutate(
+    state = "IL", id_operation_DOA = NA, name_owner_doa = NA, name_facility_doa = NA, my_Id_facility_doa = NA)
+
+# combined dataset of all the epa-doa matches + doa and epa facilities that do not have matches
+epa_doa <- rbind(matches_3, doa_not_in_matches_final, epa_not_in_matches_final)
+
+  
+```
+
+```{r}
+# Cleaning up the coords of the epa-doa dataset
+
+help_1 <- epa_doa %>%
+  filter(!is.na(myId_facility_epa)) %>% # Exclude NA values for myId_facility_epa
+  group_by(myId_facility_epa) %>%
+  filter(n_distinct(lon_correct) > 1) # 56 entries
+
+# Export epa_doa in Excel to keep the best set of coords
+write.csv(epa_doa, file.path(file_path_2, "epa_doa.csv"), row.names = FALSE) 
+# for a lot of the rows in help_1, there was a mistake in the id for the epa dataset where the same id was used for two diff facilities with 2 diff coords (fixed in Excel)
+
+#From Excel
+epa_doa_1 <- read_csv(file.path(file_path_2, "epa_doa_1.csv"))
+
+help_2 <- epa_doa_1 %>%
+  filter(!is.na(my_Id_facility_doa)) %>% # Exclude NA values for myId_facility_epa
+  group_by(my_Id_facility_doa) %>%
+  filter(n_distinct(lon_correct) > 1) # 18 entries - Export to Excel and fix manually
+
+#From Excel 
+epa_doa_2 <- read_csv(file.path(file_path_2, "epa_doa_2.csv"))
+
+
+help_3 <- epa_doa_2 %>%
+  filter(!is.na(my_Id_facility_doa)) %>% # Exclude NA values for myId_facility_epa
+  group_by(my_Id_facility_doa) %>%
+  filter(n_distinct(lon_correct) > 1) # now has 3 entries but their coords appear exactly the same (perhaps the diff is in a higher decimal place which doesn't really make a diff)
+
+# The dataset epa_doa_2 is collapsed to the facility-by-name-by-name-owner level, that is, the same facility (identifid by my_Id_facility) corresponds to multiple rows if the name_owner or name_facility are event slightly different. We want to collapse the final dataset to 1 row per facility.
+
+```
+
+# Collapsing the dataset so that 1 row corresponds to 1 facility
+
+```{r}
+# Collapsing the name_owner_doa of facilities
+library(stringdist)
+epa_doa_3 <- epa_doa_2 %>%
+  mutate(my_Id_facility_doa = ifelse(my_Id_facility_doa == "", NA, my_Id_facility_doa)) %>%
+  group_by(my_Id_facility_doa) %>%
+  mutate(
+    name_owner_doa = ifelse(
+      is.na(my_Id_facility_doa), 
+      name_owner_doa, # Leave rows with NA in my_Id_facility_doa as they are
+      {
+        # Get unique names in the group
+        unique_names <- unique(name_owner_doa[!is.na(name_owner_doa)])
+        
+        if (length(unique_names) <= 1) {
+          unique_names # If there's only one unique name, keep it
+        } else {
+          # Compute the pairwise string distance. If the string dist < 0.1 then we will keep the name that is longer. Otherwise we will keep both names separated by a semicolon.
+          dist_matrix <- stringdistmatrix(unique_names, unique_names, method = "cosine")
+          rownames(dist_matrix) <- unique_names
+          colnames(dist_matrix) <- unique_names
+          
+          # Find and merge names with distance < 0.1
+          merged_names <- character()
+          while (length(unique_names) > 0) {
+            current <- unique_names[1]
+            close_matches <- unique_names[stringdist(current, unique_names, method = "cosine") < 0.1]
+            longest_name <- close_matches[which.max(nchar(close_matches))]
+            merged_names <- c(merged_names, longest_name)
+            unique_names <- setdiff(unique_names, close_matches)
+          }
+          
+          # Return merged names separated by a semicolon
+          paste(unique(merged_names), collapse = "; ")
+        }
+      }
+    )
+  ) %>%
+  ungroup()
+
+
+
+```
+
+```{r}
+# Collapsing the name_facility_doa of facilities.
+
+epa_doa_4 <- epa_doa_3 %>%
+  mutate(my_Id_facility_doa = ifelse(my_Id_facility_doa == "", NA, my_Id_facility_doa)) %>%
+  group_by(my_Id_facility_doa) %>%
+  mutate(
+    name_facility_doa = ifelse(
+      is.na(my_Id_facility_doa), 
+      name_facility_doa, # Leave rows with NA in my_Id_facility_doa as they are
+      {
+        # Get unique names in the group
+        unique_names <- unique(name_facility_doa[!is.na(name_facility_doa)])
+        
+        if (length(unique_names) <= 1) {
+          unique_names # If there's only one unique name, keep it. If the string dist < 0.1 then we will keep the name that is longer. Otherwise we will keep both names separated by a semicolon.
+        } else {
+          # Compute the pairwise string distance
+          dist_matrix <- stringdistmatrix(unique_names, unique_names, method = "cosine")
+          rownames(dist_matrix) <- unique_names
+          colnames(dist_matrix) <- unique_names
+          
+          # Find and merge names with distance < 0.1
+          merged_names <- character()
+          while (length(unique_names) > 0) {
+            current <- unique_names[1]
+            close_matches <- unique_names[stringdist(current, unique_names, method = "cosine") < 0.1]
+            longest_name <- close_matches[which.max(nchar(close_matches))]
+            merged_names <- c(merged_names, longest_name)
+            unique_names <- setdiff(unique_names, close_matches)
+          }
+          
+          # Return merged names separated by a semicolon
+          paste(unique(merged_names), collapse = ";")
+        }
+      }
+    )
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+# Collapsing the name_facility_epa of facilities
+
+epa_doa_5 <- epa_doa_4 %>%
+  mutate(my_Id_facility_doa = ifelse(my_Id_facility_doa == "", NA, my_Id_facility_doa)) %>%
+  group_by(my_Id_facility_doa) %>%
+  mutate(
+    name_facility_epa = ifelse(
+      is.na(my_Id_facility_doa), 
+      name_facility_epa, # Leave rows with NA in my_Id_facility_doa as they are
+      {
+        # Get unique names in the group
+        unique_names <- unique(name_facility_epa[!is.na(name_facility_epa)])
+        
+        if (length(unique_names) <= 1) {
+          unique_names # If there's only one unique name, keep it. If the string dist < 0.1 then we will keep the name that is longer. Otherwise we will keep both names separated by a semicolon.
+        } else {
+          # Compute the pairwise string distance
+          dist_matrix <- stringdistmatrix(unique_names, unique_names, method = "cosine")
+          rownames(dist_matrix) <- unique_names
+          colnames(dist_matrix) <- unique_names
+          
+          # Find and merge names with distance < 0.1
+          merged_names <- character()
+          while (length(unique_names) > 0) {
+            current <- unique_names[1]
+            close_matches <- unique_names[stringdist(current, unique_names, method = "cosine") < 0.1]
+            longest_name <- close_matches[which.max(nchar(close_matches))]
+            merged_names <- c(merged_names, longest_name)
+            unique_names <- setdiff(unique_names, close_matches)
+          }
+          
+          # Return merged names separated by a semicolon
+          paste(unique(merged_names), collapse = ";")
+        }
+      }
+    )
+  ) %>%
+  ungroup()
+
+
+# Now for my_Id_facility_epa which do not have a corresponding myId_facility_doa
+epa_doa_6 <- epa_doa_5 %>%
+  group_by(myId_facility_epa) %>%
+  mutate(
+    name_facility_epa = ifelse(
+      !is.na(my_Id_facility_doa), 
+      name_facility_epa, # Skip rows with a corresponding my_Id_facility_doa
+      {
+        # Get unique names in the group
+        unique_names <- unique(name_facility_epa[!is.na(name_facility_epa)])
+        
+        if (length(unique_names) <= 1) {
+          unique_names # If there's only one unique name, keep it. If the string dist < 0.1 then we will keep the name that is longer. Otherwise we will keep both names separated by a semicolon.
+        } else {
+          # Compute the pairwise string distance
+          dist_matrix <- stringdistmatrix(unique_names, unique_names, method = "cosine")
+          rownames(dist_matrix) <- unique_names
+          colnames(dist_matrix) <- unique_names
+          
+          # Find and merge names with distance < 0.1
+          merged_names <- character()
+          while (length(unique_names) > 0) {
+            current <- unique_names[1]
+            close_matches <- unique_names[stringdist(current, unique_names, method = "cosine") < 0.1]
+            longest_name <- close_matches[which.max(nchar(close_matches))]
+            merged_names <- c(merged_names, longest_name)
+            unique_names <- setdiff(unique_names, close_matches)
+          }
+          
+          # Return merged names separated by a semicolon
+          paste(unique(merged_names), collapse = "; ")
+        }
+      }
+    )
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+# Collapsing the id_operation_DOA of facilities to 1 row
+
+epa_doa_7 <- epa_doa_6 %>%
+  group_by(my_Id_facility_doa) %>%
+  mutate(
+    id_operation_DOA = ifelse(
+      is.na(my_Id_facility_doa), 
+      id_operation_DOA, # Leave rows with NA in my_Id_facility_doa as they are
+      {
+        # Get unique id_operation_DOA in the group
+        unique_operations <- unique(id_operation_DOA[!is.na(id_operation_DOA)])
+        
+        if (length(unique_operations) == 0) {
+          id_operation_DOA # If all rows have NA for id_operation_DOA, leave as is
+        } else {
+          # If there's more than one id_operation_DOA, join them with a semicolon
+          paste(unique_operations, collapse = "; ")
+        }
+      }
+    )
+  ) %>%
+  ungroup()
+
+
+```
+
+```{r}
+# Making sure that each my_Id_facility_doa and each myId_facility_epa corresponds to just one address and set of coords
+
+epa_doa_8 <- epa_doa_7 %>%
+  group_by(my_Id_facility_doa) %>%
+  mutate(
+    # If my_Id_facility_doa is NA, keep the original values
+    address_correct = ifelse(is.na(my_Id_facility_doa), address_correct, address_correct[which.max(nchar(address_correct))]),
+    lat_correct = ifelse(is.na(my_Id_facility_doa), lat_correct, first(lat_correct)),
+    lon_correct = ifelse(is.na(my_Id_facility_doa), lon_correct, first(lon_correct)) # Recall that the coords were checked previously to retain the most accurate one for each facility and this was applied to all rows corresponding that facility.
+  ) %>%
+  ungroup() # Ungroup to ensure all rows are kept
+
+epa_doa_9 <- epa_doa_8 %>%
+  group_by(myId_facility_epa) %>%
+  mutate(
+    # If myId_facility_epa is NA, keep the original values
+    address_correct = ifelse(is.na(myId_facility_epa), address_correct, address_correct[which.max(nchar(address_correct))]),
+    lat_correct = ifelse(is.na(my_Id_facility_doa), lat_correct, first(lat_correct)),
+    lon_correct = ifelse(is.na(my_Id_facility_doa), lon_correct, first(lon_correct)) # Recall that the coords were checked previously to retain the most accurate one for each facility and this was applied to all rows corresponding that facility.
+  ) %>%
+  ungroup() # Ungroup to ensure all rows are kept
+
+
+epa_doa_final <- epa_doa_9 %>%
+  distinct() # Checked that each row corresponds to a unique my_Id_facility_doa and myId_facility_epa and that the same ID does not appear in more than 1 row.
+
+write.csv(epa_doa_final, file.path(file_path_2, "epa_doa_final.csv"), row.names = FALSE)
+
+
+matches_DOA_EPA <- read_excel(file.path(file_path_2, "matches_DOA-EPA-2.xlsx")) # Some of the facilities here are repeated in epa_doa_final so I will manually go through them in Excel and combine the two datasets
+
+
+# From Excel. Final dataset: this is the dataset that contains facilities from both epa_doa_final and matches_DOA_EPA
+matches_epa_doa_final <- read_csv("/Users/zarrinali/Documents/AFOs_IL/dataFINAL_Zarrin/matches_epa_doa_final.csv")
+
+```
