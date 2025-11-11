@@ -1,5 +1,5 @@
 # R-code-samples
-This repository contains selected R Markdown files demonstrating data cleaning, transformation, visualization, and analysis skills.  
+This repository contains R Markdown files demonstrating data cleaning, transformation, visualization, and analysis skills.  
 Data files used in these scripts are not included due to confidentiality.  
 
 ## Files
@@ -17,7 +17,7 @@ Data files used in these scripts are not included due to confidentiality.
 
 - `IMR-AFO Data Analysis (Regressions).Rmd`
   This code was written by me when I was working as an RA for Professor Eyal Frank at Harris School of Public Policy in UChicago.
-  This script analyzes the relationship between infant mortality rates (IMR) and the number of animal feeding operations (AFOs) across counties in five U.S. states (NC, MI, WI, IA, MN). It uses datasets for IMR and AFOs by distance gradation around population-weighted and geographic centroids at the county-by-year-by-month level for each of the states mentioned. (These datasets are created in the script called IMR-AFO Data Wranging (for regressions)).The script constructs merged datasets at the county-year-month level, applies state-specific temporal truncations, and estimates fixed-effects regressions to quantify associations between AFO activity and IMR under varying model specifications. In total, 36 regression models are produced—covering both IMR measures, centroid types, and fixed-effects combinations whose results are saved as text tables for further interpretation.
+  This script analyzes the relationship between infant mortality rates (IMR) and the number of animal feeding operations (AFOs) across counties in five U.S. states (NC, MI, WI, IA, MN). It uses datasets for IMR and AFOs by distance gradation around population-weighted and geographic centroids at the county-by-year-by-month level for each of the states mentioned. (These datasets are created in the script called `IMR-AFO Data Wranging (for regressions).Rmd`).The script constructs merged datasets at the county-year-month level, applies state-specific temporal truncations, and estimates fixed-effects regressions to quantify associations between AFO activity and IMR under varying model specifications. In total, 36 regression models are produced, covering both IMR measures, centroid types, and fixed-effects combinations whose results are saved as text tables for further interpretation.
 
 - `IL DOA-EPA matching_Zarrin_final.Rmd`
   This code was written by me when I was working as an RA for Professor Eyal Frank at Harris School of Public Policy in UChicago.
