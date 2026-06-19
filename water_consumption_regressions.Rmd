@@ -1,0 +1,761 @@
+---
+title: "Consumption Regressions"
+output:
+  html_document:
+    df_print: paged
+date: "2026-04-13"
+---
+
+```{r setup, include=FALSE}
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  here, tidyverse, rlist, modelsummary,
+  haven, corrplot, effectsize, emmeans, 
+  lmtest, lfe, stargazer, scales, tigris, sf, fixest,
+  ggplot2, readr, fixest, arrow
+)
+```
+
+The goal of this script is to create some necessary variables and estimate the impact of treatment on daily water consumption using several regressopn specfications (different combinations of fixed effects, different time periods, winsorized and trimmed regressions, dropping observations based on prespecified rules). This is part of an RCT design where treated households were given information on their water consumption and pricing depending on which treatment arm they were placed in. There are three separate treatment arms: SC, SPC and RPC.
+
+We look at three separate time windows: 
+1. Full: December 2023 - May 2025 is the pre-period and June 2025 - December 2025 is the post-period.
+2. Summer: June - October 2024 is the pre-period and June - October 2025 is the post-period. Both periods include observations through October 31. The post-period begins on the date a household receives its first notification and therefore varies
+across households. The pre-period begins on the corresponding date in 2024.
+3. Six months: December 2024 - May 2025 is the pre-period and June - October 2025 is the post-period. For each household, the pre-period begins on the day they receive their first notification minus 180 days. The post-period ends on the day they receive their first notification plus 180 days.
+
+All winsorization and trimming are done after restricting the sample to the relevant time periods for that specific model. Winsorization is done at the top 0.1%, 0.5% and 1% at the observation level. Trimming is done by removing the top 0.1%, 0.5% and 1% of households based on average pre-consumption which is the average daily water usage per household in the pre-period depending on the specific model.
+
+We also look at some specifications having removed the daily water consumption values that are zero or negative where the latter is due to a meter resetting issue. 
+
+
+# Load data
+```{r}
+# Dataset was saved as parquet to optimize space
+merged_treat_clean <- read_parquet("~/projects/eel/westminster/use_data/price_experiment/analysis_files/daily_consumption_with_treatment.parquet")
+```
+
+
+# Function for var creation
+```{r}
+# Function for dummy vars
+
+create_dummy_variables <- function(data, column_name) {
+  result_data <- data.frame(data)
+  if (!is.factor(result_data[[column_name]])) {
+    result_data[[column_name]] <- as.factor(result_data[[column_name]])
+  }
+  
+  dummy_levels <- levels(result_data[[column_name]])
+  
+  dummy_names <- c()
+  for (level in dummy_levels) {
+    dummy_name <- paste0(column_name, "_", make.names(level))
+    dummy_names <- append(dummy_names, dummy_name)
+    result_data[[dummy_name]] <- as.integer(result_data[[column_name]] == level)
+  }
+  
+  return(list(result_data, dummy_names))
+}
+
+```
+
+# Creating vars for regressions
+
+Households are grouped into different billing cycles. The treatment period (during which households received notifications about their water usage) was between June-October 2025. Therefore, each household received the first notification on a different day in June based on their billing cycle. The post treatment period variable is created below based on this first notification date.
+
+```{r}
+cycle_notif_mappings <- list()
+for (cyc in unique(merged_treat_clean_1$cycle)) {
+  data_filt <- merged_treat_clean_1 %>% filter(cycle == cyc)
+  cycle_notif_mappings[[paste(cyc)]] <- unique(na.omit(data_filt$first_notification))
+}
+
+notification_df <- data.frame(
+  cycle = as.integer(names(cycle_notif_mappings)),
+  replacement_date = as.Date(unlist(cycle_notif_mappings), origin = "1970-01-01"),
+  stringsAsFactors = FALSE
+)
+rownames(notification_df) <- NULL
+
+
+# Date of first notification for treated groups
+merged_treat_clean_2 <- merged_treat_clean %>%
+  left_join(notification_df, by = "cycle") %>%
+  mutate(
+    first_notification_analysis = case_when(
+      treatment == "Control" ~ replacement_date,
+      TRUE ~ first_notification
+    )
+  ) %>%
+  select(-replacement_date)
+
+# Creating post variable depending on first notification date
+consumption_interval_panel <- merged_treat_clean_2 %>%
+  arrange(acct, date) %>%
+  group_by(acct) %>%
+  mutate(
+    # Ensuring that var is in the correct format
+    treatment_time = as.POSIXct(first_notification_analysis),
+    post = case_when(
+      is.na(date) | is.na(treatment_time) ~ NA_real_,
+      date < treatment_time ~ 0, 
+      date >= treatment_time ~ 1, # the date on which first notif is received is assumed to be post
+      TRUE ~ NA_real_
+    )) %>%
+  ungroup()
+
+# Checking for missing data
+consumption_interval_panel %>%
+  summarise(
+    na_post = sum(is.na(post)),
+    na_treatment = sum(is.na(treatment)),
+    na_daily_usage_clean = sum(is.na(daily_usage_clean))
+  ) #212358 obs in daily_usage_clean are missing
+
+missing_by_day <- consumption_interval_panel %>%
+  filter(is.na(daily_usage_clean)) %>%
+  count(date, sort = TRUE)
+
+consumption_interval_panel_1 <- consumption_interval_panel %>%
+  filter(
+    !is.na(daily_usage_clean)
+  )
+
+
+# Fixed effects
+consumption_interval_panel_1 <- consumption_interval_panel_1 %>%
+  mutate(
+    day_fe = date)
+
+# Treatment dummies
+dummy_output <- create_dummy_variables(consumption_interval_panel_1, "treatment")
+consumption_interval_panel_1 <- dummy_output[[1]]
+treatment_dummy_names <- dummy_output[[2]]
+
+rm(dummy_output)
+gc()
+
+
+# Interaction variables needed for regressions
+consumption_interval_panel_1 <- consumption_interval_panel_1 %>%
+  mutate(
+    treat = as.integer(treatment != "Control"),
+    treat_post = treat * post
+  )
+
+# Treatment-specific post interactions
+for (v in treatment_dummy_names) {
+  if (v != "treatment_Control") {
+    new_name <- paste0(v, "_post")
+    consumption_interval_panel_1[[new_name]] <- consumption_interval_panel_1[[v]] * consumption_interval_panel_1$post
+  }
+}
+
+# Regression-ready panel with relevant variables
+consump_panel <- consumption_interval_panel_1 %>%
+  select(
+    meter_id, acct, treatment, post, first_notification_analysis,
+    treat, treat_post,
+    all_of(treatment_dummy_names),
+    ends_with("_post"),
+    date, day_fe, 
+    daily_usage, daily_usage_clean,
+  )
+
+# Removing datasets to optimize memory usage
+rm(consumption_interval_panel, consumption_interval_panel_1, data_filt, merged_treat_clean_1, merged_treat_clean_2)
+
+
+```
+
+
+# Daily water consumption regressions
+
+## Functions for regressions
+
+```{r}
+# Functions cluster SEs at the HH (acct) level
+# Function produce models with no FE, only HH FE, only date FE, then both HH and date FE
+
+# For specifications that use daily_usage_clean 
+run_did_specs <- function(rhs, data, cluster_var = "acct") {
+  feols(
+    as.formula(paste0(
+      "daily_usage_clean ~ ", rhs,
+      " | sw(0, acct, day_fe, acct + day_fe)"
+    )),
+    data = data,
+    cluster = as.formula(paste0("~", cluster_var))
+  )
+}
+
+# For slightly more complex specifications
+run_did_specs_other <- function(lhs, rhs, data, cluster_var = "acct") {
+  feols(
+    as.formula(paste0(
+      lhs, " ~ ", rhs,
+      " | sw(0, acct, day_fe, acct + day_fe)"
+    )),
+    data = data,
+    cluster = as.formula(paste0("~", cluster_var))
+  )
+}
+
+# Function to view all 4 specifications at once
+view_did_specs <- function(spec) {
+  fe_labels <- c("No FE", "Acct FE", "Day FE", "Acct + Day FE")
+  for (i in 1:4) {
+    cat("\n====", fe_labels[i], "====\n")
+    print(summary(spec[[i]]))
+  }
+}
+
+# Winsorized
+winsorize_top <- function(x, p) {
+  threshold <- quantile(x, 1 - p, na.rm = TRUE)
+  pmin(x, threshold)
+}
+
+# Trimming function — drops HHs above the threshold based on avg HH preconsumption
+trim_top_hh <- function(data, hh_stats, p) {
+  threshold <- quantile(hh_stats$avg_pre_usage, 1 - p, na.rm = TRUE)
+  keep_accts <- hh_stats %>% filter(avg_pre_usage <= threshold) %>% pull(acct)
+  data %>% filter(acct %in% keep_accts)
+}
+
+```
+
+
+# Functions for saving output
+
+```{r}
+save_did_etable <- function(models, file, title = NULL) {
+  etable(
+    models,
+    tex = TRUE,
+    file = file,
+    replace = TRUE,
+    title = title,
+    depvar = TRUE,
+    
+    dict = c(
+      daily_usage_clean = "Daily Consumption",
+      "(Intercept)" = "Constant",
+      log_daily_usage_no_0 = "Log Consumption",
+      log_daily_usage_no_neg = "Log (Consumption + 1)",
+      arcsinh_daily_usage_no_neg = "arcsinh(consumption)",
+      daily_usage_w0.1 = "Daily Consumption",
+      daily_usage_w0.5 = "Daily Consumption",
+      daily_usage_w1 = "Daily Consumption",
+      daily_usage_summer_w0.1 = "Daily Consumption",
+      daily_usage_summer_w0.5 = "Daily Consumption",
+      daily_usage_summer_w1 = "Daily Consumption",
+      treat_post = "Treatment × Post",
+      treatment_SC_post = "SC × Post",
+      treatment_SPC_post = "SPC × Post",
+      treatment_RPC_post = "RPC × Post",
+      acct = "HH FE",
+      day_fe = "Date FE"
+    ),
+    se.below = TRUE,
+    signif.code = c("***" = 0.01, "**" = 0.05, "*" = 0.10)
+  )
+}
+
+save_all_did_tables <- function(model_list, output_dir = "~/projects/eel/westminster/zarrin/code_new/price_salience/analysis/analysis_zarrin/reg_tables") {
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+  for (nm in names(model_list)) {
+    save_did_etable(
+      models = model_list[[nm]],
+      file = file.path(output_dir, paste0(nm, ".tex")),
+      title = nm
+    )
+  }
+}
+```
+
+
+## Dec2023-Dec2025
+```{r}
+
+spec1_dec2023_2025 <- run_did_specs(
+  rhs = "treat_post",
+  data = consump_panel
+)
+
+spec2_dec2023_2025 <- run_did_specs(
+  rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post",
+  data = consump_panel
+)
+
+view_did_specs(spec1_dec2023_2025)
+view_did_specs(spec2_dec2023_2025)
+```
+
+
+### Winsorized
+
+```{r}
+consump_panel <- consump_panel %>%
+  mutate(daily_usage_w0.1 = winsorize_top(daily_usage_clean, 0.001),
+         daily_usage_w0.5 = winsorize_top(daily_usage_clean, 0.005),
+         daily_usage_w1 = winsorize_top(daily_usage_clean, 0.01))
+
+# regressions
+spec1_dec2023_2025_w0.1 <- run_did_specs_other("daily_usage_w0.1", "treat_post", consump_panel)
+spec1_dec2023_2025_w0.5 <- run_did_specs_other("daily_usage_w0.5", "treat_post", consump_panel)
+spec1_dec2023_2025_w1   <- run_did_specs_other("daily_usage_w1", "treat_post", consump_panel)
+
+spec2_dec2023_2025_w0.1 <- run_did_specs_other("daily_usage_w0.1",
+  "treatment_SC_post + treatment_SPC_post + treatment_RPC_post",
+  consump_panel)
+
+spec2_dec2023_2025_w0.5 <- run_did_specs_other("daily_usage_w0.5",
+  "treatment_SC_post + treatment_SPC_post + treatment_RPC_post",
+  consump_panel)
+
+spec2_dec2023_2025_w1 <- run_did_specs_other("daily_usage_w1",
+  "treatment_SC_post + treatment_SPC_post + treatment_RPC_post",
+  consump_panel)
+
+
+```
+
+### Trimmed
+
+```{r}
+# average pre-period consumption per HH
+hh_avg_pre <- consump_panel %>%
+  filter(post == 0) %>%
+  group_by(acct) %>%
+  summarise(avg_pre_usage = mean(daily_usage_clean, na.rm = TRUE))
+
+consump_panel_t0.1 <- trim_top_hh(consump_panel, hh_avg_pre, 0.001)
+consump_panel_t0.5 <- trim_top_hh(consump_panel, hh_avg_pre, 0.005)
+consump_panel_t1   <- trim_top_hh(consump_panel, hh_avg_pre, 0.01)
+
+# regressions
+spec1_dec2023_2025_t0.1 <- run_did_specs(rhs = "treat_post", data = consump_panel_t0.1)
+spec1_dec2023_2025_t0.5 <- run_did_specs(rhs = "treat_post", data = consump_panel_t0.5)
+spec1_dec2023_2025_t1 <- run_did_specs(rhs = "treat_post", data = consump_panel_t1)
+
+spec2_dec2023_2025_t0.1 <- run_did_specs(rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_t0.1)
+spec2_dec2023_2025_t0.5 <- run_did_specs(rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_t0.5)
+spec2_dec2023_2025_t1   <- run_did_specs(rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_t1)
+
+# freeing up space
+rm(consump_panel_t0.1, consump_panel_t0.5, consump_panel_t1)
+
+```
+
+### Removing all observations with 0 consumption
+
+```{r}
+# We look at log(daily consumption) in this case
+
+consump_panel <- consump_panel %>%
+  mutate(log_daily_usage_no_0 = if_else(daily_usage_clean > 0, log(daily_usage_clean), NA_real_))
+
+spec1_dec2023_2025_no_0 <- run_did_specs_other("log_daily_usage_no_0", "treat_post", consump_panel)
+
+spec2_dec2023_2025_no_0 <- run_did_specs_other("log_daily_usage_no_0", "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel)
+```
+
+### Removing all observations with negative consumption
+
+```{r}
+# Check: daily_usage has positive, negative and 0 values. 
+
+# We look at both log(daily consumption + 1) and arcsinh(daily consumption)
+
+consump_panel <- consump_panel %>%
+  mutate(log_daily_usage_no_neg = if_else(daily_usage >= 0, log(daily_usage_clean + 1), NA_real_),
+         arcsinh_daily_usage_no_neg = if_else(daily_usage >= 0, asinh(daily_usage_clean), NA_real_))
+
+# log spec
+spec1_dec2023_2025_no_neg_log <- run_did_specs_other("log_daily_usage_no_neg", "treat_post", consump_panel)
+
+spec2_dec2023_2025_no_neg_log <- run_did_specs_other("log_daily_usage_no_neg", "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel)
+
+# arcsinh spec
+spec1_dec2023_2025_no_neg_arcsinh <- run_did_specs_other("arcsinh_daily_usage_no_neg", "treat_post", consump_panel)
+
+spec2_dec2023_2025_no_neg_arcsinh <- run_did_specs_other("arcsinh_daily_usage_no_neg", "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel)
+```
+
+
+### Saving output
+
+```{r}
+dec_2023_2025_did_specs <- list(
+  spec1_dec2023_2025 = spec1_dec2023_2025,
+  spec2_dec2023_2025 = spec2_dec2023_2025,
+  # Winsorized
+  spec1_dec2023_2025_w0.1 = spec1_dec2023_2025_w0.1,
+  spec1_dec2023_2025_w0.5 = spec1_dec2023_2025_w0.5,
+  spec1_dec2023_2025_w1   = spec1_dec2023_2025_w1,
+
+  spec2_dec2023_2025_w0.1 = spec2_dec2023_2025_w0.1,
+  spec2_dec2023_2025_w0.5 = spec2_dec2023_2025_w0.5,
+  spec2_dec2023_2025_w1   = spec2_dec2023_2025_w1,
+  
+  # Top trimming
+  spec1_dec2023_2025_t0.1 = spec1_dec2023_2025_t0.1,
+  spec1_dec2023_2025_t0.5 = spec1_dec2023_2025_t0.5,
+  spec1_dec2023_2025_t1   = spec1_dec2023_2025_t1,
+
+  spec2_dec2023_2025_t0.1 = spec2_dec2023_2025_t0.1,
+  spec2_dec2023_2025_t0.5 = spec2_dec2023_2025_t0.5,
+  spec2_dec2023_2025_t1   = spec2_dec2023_2025_t1,
+  
+  # no 0s
+  spec1_dec2023_2025_no_0 = spec1_dec2023_2025_no_0,
+  spec2_dec2023_2025_no_0 = spec2_dec2023_2025_no_0,
+  # no neg usages
+  spec1_dec2023_2025_no_neg_log = spec1_dec2023_2025_no_neg_log,
+  spec2_dec2023_2025_no_neg_log = spec2_dec2023_2025_no_neg_log,
+  spec1_dec2023_2025_no_neg_arcsinh = spec1_dec2023_2025_no_neg_arcsinh,
+  spec2_dec2023_2025_no_neg_arcsinh = spec2_dec2023_2025_no_neg_arcsinh
+  
+)
+save_all_did_tables(
+  model_list = dec_2023_2025_did_specs,
+  output_dir = "~/projects/eel/westminster/output/pricing_experiment/reg_tex_files"
+)
+
+# freeing up space
+rm(list = ls(pattern = "^spec"))
+
+```
+
+
+## Preperiod: June-Oct 2024, Postperiod: June-Oct 2025
+
+```{r}
+consump_panel_summer <- consump_panel %>%
+  mutate(
+    # Post-period start
+    post_start = as.Date(first_notification_analysis),
+    # Post-period end
+    post_end = as.Date("2025-10-31"),
+    # Pre-period start = exactly 1 year earlier
+    pre_start = post_start %m-% years(1),
+    # Pre-period end = Oct 31 2024
+    pre_end = as.Date("2024-10-31")
+  )
+
+# Each HH should only contribute observations inside either window
+consump_panel_summer <- consump_panel_summer %>%
+  filter(
+    (date >= pre_start & date <= pre_end) |
+    (date >= post_start & date <= post_end)
+  )
+```
+
+
+```{r}
+spec1_summer2024_vs_2025 <- run_did_specs(
+  rhs = "treat_post",
+  data = consump_panel_summer
+)
+
+spec2_summer2024_vs_2025 <- run_did_specs(
+  rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post",
+  data = consump_panel_summer
+)
+
+```
+
+
+### Winsorized
+
+```{r}
+consump_panel_summer <- consump_panel_summer %>%
+  mutate(daily_usage_summer_w0.1 = winsorize_top(daily_usage_clean, 0.001),
+         daily_usage_summer_w0.5 = winsorize_top(daily_usage_clean, 0.005),
+         daily_usage_summer_w1 = winsorize_top(daily_usage_clean, 0.01))
+
+# regressions
+spec1_summer2024_vs_2025_w0.1 <- run_did_specs_other("daily_usage_summer_w0.1", rhs = "treat_post", data = consump_panel_summer)
+spec1_summer2024_vs_2025_w0.5 <- run_did_specs_other("daily_usage_summer_w0.5", rhs = "treat_post", data = consump_panel_summer)
+spec1_summer2024_vs_2025_w1 <- run_did_specs_other("daily_usage_summer_w1", rhs = "treat_post", data = consump_panel_summer)
+
+spec2_summer2024_vs_2025_w0.1 <- run_did_specs_other("daily_usage_summer_w0.1", 
+  rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post",
+  data = consump_panel_summer
+)
+spec2_summer2024_vs_2025_w0.5 <- run_did_specs_other("daily_usage_summer_w0.5", 
+  rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post",
+  data = consump_panel_summer
+)
+spec2_summer2024_vs_2025_w1 <- run_did_specs_other("daily_usage_summer_w1", 
+  rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post",
+  data = consump_panel_summer
+)
+```
+
+
+
+### Trimmed
+
+```{r}
+# average pre-period consumption per HH
+hh_avg_pre_summer <- consump_panel_summer %>%
+  filter(post == 0) %>%
+  group_by(acct) %>%
+  summarise(avg_pre_usage = mean(daily_usage_clean, na.rm = TRUE))
+
+# trimmed datasets
+consump_panel_summer_t0.1 <- trim_top_hh(consump_panel_summer, hh_avg_pre_summer, 0.001)
+consump_panel_summer_t0.5 <- trim_top_hh(consump_panel_summer, hh_avg_pre_summer, 0.005)
+consump_panel_summer_t1   <- trim_top_hh(consump_panel_summer, hh_avg_pre_summer, 0.01)
+
+# regressions
+spec1_summer2024_vs_2025_t0.1 <- run_did_specs(rhs = "treat_post", data = consump_panel_summer_t0.1)
+spec1_summer2024_vs_2025_t0.5 <- run_did_specs(rhs = "treat_post", data = consump_panel_summer_t0.5)
+spec1_summer2024_vs_2025_t1 <- run_did_specs(rhs = "treat_post", data = consump_panel_summer_t1)
+
+spec2_summer2024_vs_2025_t0.1 <- run_did_specs(rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_summer_t0.1)
+spec2_summer2024_vs_2025_t0.5 <- run_did_specs(rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_summer_t0.5)
+spec2_summer2024_vs_2025_t1   <- run_did_specs(rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_summer_t1)
+```
+
+
+### Removing all observations with 0 consumption
+
+```{r}
+spec1_summer2024_vs_2025_no_0 <- run_did_specs_other("log_daily_usage_no_0", "treat_post", consump_panel_summer)
+
+spec2_summer2024_vs_2025_no_0 <- run_did_specs_other("log_daily_usage_no_0", "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_summer)
+```
+
+### Removing all observations with negative consumption
+
+```{r}
+
+# log spec
+spec1_summer2024_vs_2025_no_neg_log <- run_did_specs_other("log_daily_usage_no_neg", "treat_post", consump_panel_summer)
+
+spec2_summer2024_vs_2025_no_neg_log <- run_did_specs_other("log_daily_usage_no_neg", "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_summer)
+
+# arcsinh spec
+spec1_summer2024_vs_2025_no_neg_arcsinh <- run_did_specs_other("arcsinh_daily_usage_no_neg", "treat_post", consump_panel_summer)
+
+spec2_summer2024_vs_2025_no_neg_arcsinh <- run_did_specs_other("arcsinh_daily_usage_no_neg", "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_summer)
+```
+
+
+
+### Saving output
+
+```{r}
+summer2024_vs_2025_did_specs <- list(
+  spec1_summer2024_vs_2025 = spec1_summer2024_vs_2025,
+  spec2_summer2024_vs_2025 = spec2_summer2024_vs_2025,
+
+  # Winsorized
+  spec1_summer2024_vs_2025_w0.1 = spec1_summer2024_vs_2025_w0.1,
+  spec1_summer2024_vs_2025_w0.5 = spec1_summer2024_vs_2025_w0.5,
+  spec1_summer2024_vs_2025_w1   = spec1_summer2024_vs_2025_w1,
+
+  spec2_summer2024_vs_2025_w0.1 = spec2_summer2024_vs_2025_w0.1,
+  spec2_summer2024_vs_2025_w0.5 = spec2_summer2024_vs_2025_w0.5,
+  spec2_summer2024_vs_2025_w1   = spec2_summer2024_vs_2025_w1,
+  
+  # Top trimming
+  spec1_summer2024_vs_2025_t0.1 = spec1_summer2024_vs_2025_t0.1,
+  spec1_summer2024_vs_2025_t0.5 = spec1_summer2024_vs_2025_t0.5,
+  spec1_summer2024_vs_2025_t1   = spec1_summer2024_vs_2025_t1,
+
+  spec2_summer2024_vs_2025_t0.1 = spec2_summer2024_vs_2025_t0.1,
+  spec2_summer2024_vs_2025_t0.5 = spec2_summer2024_vs_2025_t0.5,
+  spec2_summer2024_vs_2025_t1   = spec2_summer2024_vs_2025_t1
+)
+
+save_all_did_tables(
+  model_list = summer2024_vs_2025_did_specs,
+  output_dir = "~/projects/eel/westminster/zarrin/code_new/price_salience/analysis/analysis_zarrin/reg_tables"
+)
+
+# Saving the new tables
+summer2024_vs_2025_did_specs_1 <- list(
+  spec1_summer2024_vs_2025_no_0 = spec1_summer2024_vs_2025_no_0,
+  spec2_summer2024_vs_2025_no_0 = spec2_summer2024_vs_2025_no_0,
+  spec1_summer2024_vs_2025_no_neg_log = spec1_summer2024_vs_2025_no_neg_log,
+  spec2_summer2024_vs_2025_no_neg_log = spec2_summer2024_vs_2025_no_neg_log,
+  spec1_summer2024_vs_2025_no_neg_arcsinh = spec1_summer2024_vs_2025_no_neg_arcsinh,
+  spec2_summer2024_vs_2025_no_neg_arcsinh = spec2_summer2024_vs_2025_no_neg_arcsinh)
+
+save_all_did_tables(
+  model_list = summer2024_vs_2025_did_specs_1,
+  output_dir = "~/projects/eel/westminster/output/pricing_experiment/reg_tex_files"
+)
+
+# freeing up space
+rm(list = ls(pattern = "^spec"))
+rm(list = ls(pattern = "^consump_panel_summer"), hh_avg_pre, hh_avg_pre_summer)
+```
+
+
+
+## 6 months pre-post: Dec 2024-2025
+
+```{r}
+consump_panel_6_mths <- consump_panel %>%
+  mutate(
+    pre_start  = first_notification_analysis - days(180),
+    pre_end    = first_notification_analysis - days(1),
+    post_start = first_notification_analysis,
+    post_end   = first_notification_analysis + days(180)
+  )
+
+# Keeping only observations inside the symmetric window
+consump_panel_6_mths <- consump_panel_6_mths %>%
+  filter(
+    date >= pre_start &
+    date <= post_end
+  )
+
+spec1_six_mths <- run_did_specs(
+  rhs = "treat_post",
+  data = consump_panel_6_mths_1
+)
+
+spec2_six_mths <- run_did_specs(
+  rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post",
+  data = consump_panel_6_mths_1
+)
+```
+
+### Winsorized
+
+```{r}
+consump_panel_6_mths_w0.1 <- consump_panel_6_mths_1 %>%
+  mutate(daily_usage_clean = winsorize_top(daily_usage_clean, 0.001))
+consump_panel_6_mths_w0.5 <- consump_panel_6_mths_1 %>%
+  mutate(daily_usage_clean = winsorize_top(daily_usage_clean, 0.005))
+consump_panel_6_mths_w1 <- consump_panel_6_mths_1 %>%
+  mutate(daily_usage_clean = winsorize_top(daily_usage_clean, 0.01))
+
+# regressions
+spec1_6_mths_w0.1 <- run_did_specs(rhs = "treat_post", data = consump_panel_6_mths_w0.1)
+spec1_6_mths_w0.5 <- run_did_specs(rhs = "treat_post", data = consump_panel_6_mths_w0.5)
+spec1_6_mths_w1 <- run_did_specs(rhs = "treat_post", data = consump_panel_6_mths_w1)
+
+spec2_6_mths_w0.1 <- run_did_specs(
+  rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post",
+  data = consump_panel_6_mths_w0.1
+)
+spec2_6_mths_w0.5 <- run_did_specs(
+  rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post",
+  data = consump_panel_6_mths_w0.5
+)
+spec2_6_mths_w1 <- run_did_specs(
+  rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post",
+  data = consump_panel_6_mths_w1
+)
+
+# freeing up space
+rm(list = ls(pattern = "^consump_panel_6_mths_w"), consump_panel_6_mths)
+```
+
+### Trimmed
+
+```{r}
+# average pre-period consumption per HH
+hh_avg_pre_6_mths <- consump_panel_6_mths %>%
+  filter(post == 0) %>%
+  group_by(acct) %>%
+  summarise(avg_pre_usage = mean(daily_usage_clean, na.rm = TRUE))
+
+# trimmed datasets
+consump_panel_6_mths_t0.1 <- trim_top_hh(consump_panel_6_mths, hh_avg_pre_6_mths, 0.001)
+consump_panel_6_mths_t0.5 <- trim_top_hh(consump_panel_6_mths, hh_avg_pre_6_mths, 0.005)
+consump_panel_6_mths_t1   <- trim_top_hh(consump_panel_6_mths, hh_avg_pre_6_mths, 0.01)
+
+# regressions
+spec1_6_mths_t0.1 <- run_did_specs(rhs = "treat_post", data = consump_panel_6_mths_t0.1)
+spec1_6_mths_t0.5 <- run_did_specs(rhs = "treat_post", data = consump_panel_6_mths_t0.5)
+spec1_6_mths_t1 <- run_did_specs(rhs = "treat_post", data = consump_panel_6_mths_t1)
+
+spec2_6_mths_t0.1 <- run_did_specs(rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_6_mths_t0.1)
+spec2_6_mths_t0.5 <- run_did_specs(rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_6_mths_t0.5)
+spec2_6_mths_t1   <- run_did_specs(rhs = "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_6_mths_t1)
+```
+
+### Removing all observations with 0 consumption
+```{r}
+
+spec1_6_mths_no_0 <- run_did_specs_other("log_daily_usage_no_0", "treat_post", consump_panel_6_mths)
+
+spec2_6_mths_no_0 <- run_did_specs_other("log_daily_usage_no_0", "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_6_mths)
+```
+
+### Removing all observations with negative consumption
+
+```{r}
+# log spec
+spec1_6_mths_no_neg_log <- run_did_specs_other("log_daily_usage_no_neg", "treat_post", consump_panel_6_mths)
+
+spec2_6_mths_no_neg_log <- run_did_specs_other("log_daily_usage_no_neg", "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_6_mths)
+
+# arcsinh spec
+spec1_6_mths_no_neg_arcsinh <- run_did_specs_other("arcsinh_daily_usage_no_neg", "treat_post", consump_panel_6_mths)
+
+spec2_6_mths_no_neg_arcsinh <- run_did_specs_other("arcsinh_daily_usage_no_neg", "treatment_SC_post + treatment_SPC_post + treatment_RPC_post", data = consump_panel_6_mths)
+```
+
+
+### Saving output
+
+```{r}
+six_mths_did_specs <- list(
+  spec1_6_mths = spec1_six_mths,
+  spec2_6_mths = spec2_six_mths,
+
+  # Winsorized
+  spec1_6_mths_w0.1 = spec1_6_mths_w0.1,
+  spec1_6_mths_w0.5 = spec1_6_mths_w0.5,
+  spec1_6_mths_w1   = spec1_6_mths_w1,
+
+  spec2_6_mths_w0.1 = spec2_6_mths_w0.1,
+  spec2_6_mths_w0.5 = spec2_6_mths_w0.5,
+  spec2_6_mths_w1   = spec2_6_mths_w1,
+  
+  # Top trimming
+  spec1_6_mths_t0.1 = spec1_6_mths_t0.1,
+  spec1_6_mths_t0.5 = spec1_6_mths_t0.5,
+  spec1_6_mths_t1   = spec1_6_mths_t1,
+
+  spec2_6_mths_t0.1 = spec2_6_mths_t0.1,
+  spec2_6_mths_t0.5 = spec2_6_mths_t0.5,
+  spec2_6_mths_t1   = spec2_6_mths_t1
+)
+
+save_all_did_tables(
+  model_list = six_mths_did_specs,
+  output_dir = "~/projects/eel/westminster/zarrin/code_new/price_salience/analysis/analysis_zarrin/reg_tables"
+)
+
+# Saving the new tables
+six_mths_did_specs_1 <- list(
+  spec1_6_mths_no_0 = spec1_6_mths_no_0,
+  spec2_6_mths_no_0 = spec2_6_mths_no_0,
+  spec1_6_mths_no_neg_log = spec1_6_mths_no_neg_log,
+  spec2_6_mths_no_neg_log = spec2_6_mths_no_neg_log,
+  spec1_6_mths_no_neg_arcsinh = spec1_6_mths_no_neg_arcsinh,
+  spec2_6_mths_no_neg_arcsinh = spec2_6_mths_no_neg_arcsinh)
+
+save_all_did_tables(
+  model_list = six_mths_did_specs_1,
+  output_dir = "~/projects/eel/westminster/output/pricing_experiment/reg_tex_files"
+)
+
+# freeing up space
+rm(list = ls(pattern = "^spec"))
+rm(list = ls(pattern = "^consump_panel_6_mths"), hh_avg_pre_6_mths)
+```
